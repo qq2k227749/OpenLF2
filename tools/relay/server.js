@@ -182,6 +182,100 @@ function createRelay(overrides = {}) {
       res.end(`OpenLF2 relay is running. Connect with a WebSocket to ${config.path}\n`);
       return;
     }
+    // F.Lobby compatibility endpoints so F.LF engine can use this relay
+    const CORS = { 'access-control-allow-origin': '*', 'cache-control': 'no-store' };
+    if (pathname === '/protocol') {
+      const addr = process.env.SERVER_URL || `http://${req.headers.host}`;
+      res.writeHead(200, { 'content-type': 'application/json', ...CORS });
+      res.end(JSON.stringify({
+        name: 'OpenLF2 Relay',
+        library: '/ws/network.js',
+        path: '/relay',
+        address: addr,
+      }));
+      return;
+    }
+    if (pathname === '/ws/network.js') {
+      res.writeHead(200, { 'content-type': 'application/javascript', ...CORS });
+      res.end(`define(function(){
+  var ws, already=false;
+  function setup(config, handler) {
+    if(already){console.error('setup already');return;}
+    already=true;
+    var host = config.server.address.replace(/^http/,'ws');
+    if(host.charAt(host.length-1)==='/') host=host.slice(0,-1);
+    var id1=config.param.id1, id2=config.param.id2;
+    var role=config.param.role||'host';
+    var room=id1||'000000';
+    ws=new WebSocket(host+'/relay?role='+role+'&room='+room);
+    var connected=false, retry, tries=0;
+    var wrapper={send:function(data){if(ws.readyState===1)ws.send(JSON.stringify(data));}};
+    ws.onopen=function(){
+      handler.on('log','connected to relay, room='+room+', role='+role);
+      if(role==='host'){
+        retry=setInterval(function(){
+          handler.on('log','waiting for opponent...');
+          if(++tries>=30){clearInterval(retry);retry=null;handler.on('error','timeout: no opponent joined');}
+        },1000);
+      }
+    };
+    ws.onclose=function(){handler.on('close');};
+    ws.onerror=function(e){handler.on('error',e);};
+    ws.onmessage=function(e){
+      var data;
+      try{data=JSON.parse(e.data);}catch(ex){return;}
+      if(data.t==='waiting'){handler.on('log','waiting for opponent in room '+data.room);return;}
+      if(data.t==='paired'){
+        if(retry){clearInterval(retry);retry=null;}
+        connected=true;
+        handler.on('log','opponent found! starting game');
+        handler.on('open',wrapper);
+        return;
+      }
+      if(connected) handler.on('data',data);
+    };
+  }
+  function teardown(){if(ws){ws.close();ws=null;}already=false;}
+  return{setup:setup,teardown:teardown};
+});`);
+      return;
+    }
+    if (pathname === '/lobby') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...CORS });
+      res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>LF2 Online</title>
+<style>body{font-family:Arial,sans;background:#1a1a2e;color:#eee;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}
+.box{background:#16213e;padding:24px;border-radius:8px;text-align:center;min-width:280px;}
+h2{color:#e94560;margin:0 0 16px;}
+input{width:100%;padding:8px;margin:6px 0;background:#0f3460;border:1px solid #e94560;color:#fff;border-radius:4px;box-sizing:border-box;font-size:14px;}
+button{width:100%;padding:10px;margin:4px 0;border:none;border-radius:4px;cursor:pointer;font-size:14px;font-weight:bold;}
+.host{background:#e94560;color:#fff;}.join{background:#0f3460;color:#fff;border:1px solid #e94560;}
+.status{margin-top:12px;font-size:13px;color:#aaa;min-height:20px;}
+</style></head><body>
+<div class="box">
+  <h2>LF2 Online</h2>
+  <input id="room" type="text" placeholder="Room code (4-12 digits)" maxlength="12">
+  <button class="host" onclick="go('host')">HOST a game</button>
+  <button class="join" onclick="go('join')">JOIN a game</button>
+  <div class="status" id="status">Enter a room code and HOST or JOIN</div>
+</div>
+<script>
+var host={origin:null,source:null};
+window.addEventListener('message',function(e){
+  if(e.data&&e.data.protocol==='F.Lobby 0.1'&&e.data.init){
+    host={origin:e.origin,source:e.source};
+  }
+});
+function go(role){
+  var room=document.getElementById('room').value.trim();
+  if(!/^\\d{4,12}$/.test(room)){document.getElementById('status').textContent='Room code must be 4-12 digits';return;}
+  document.getElementById('status').textContent=(role==='host'?'Hosting':'Joining')+' room '+room+'...';
+  if(host.source){
+    host.source.postMessage({event:'start',role:role==='host'?'active':'passive',id1:room,id2:room},host.origin);
+  }
+}
+</script></body></html>`);
+      return;
+    }
     res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('Not found\n');
   });
