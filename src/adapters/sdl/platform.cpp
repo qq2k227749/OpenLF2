@@ -2,7 +2,6 @@
 // Copyright (c) 2026 OpenLF2 contributors
 
 #include "openlf2/ports/platform.hpp"
-#include "openlf2/ports/log.hpp"
 #include "openlf2/detail/sdl/frame_upscaler.hpp"
 #include "openlf2/detail/sdl/haptics.hpp"
 #include "openlf2/detail/sdl/setup_screen.hpp"
@@ -26,23 +25,9 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#endif
 
 namespace openlf2 {
 namespace {
-#ifdef __EMSCRIPTEN__
-// Resolves on the browser's next animation frame (its vsync). Without requestAnimationFrame, or while the tab is hidden
-// and frames are withheld, a timer stands in (60 Hz, 100 ms) so the game never stalls.
-EM_ASYNC_JS(void, wait_animation_frame, (), {
-    await new Promise(resolve => {
-        const animated = typeof requestAnimationFrame === 'function';
-        const timer = setTimeout(resolve, animated ? 100 : 1000 / 60);
-        if (animated) requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
-    });
-});
-#endif
 // The open-file dialog's result. SDL may call back on another thread and after the platform is
 // gone, so the slot lives for the whole process.
 struct DialogSlot {
@@ -56,7 +41,7 @@ DialogSlot& dialog_slot() {
 #ifndef __EMSCRIPTEN__
 void SDLCALL dialog_finished(void*, const char* const* files, int) {
     if (files == nullptr) {
-        log(LogLevel::warning) << "Replay: the file dialog failed: " << SDL_GetError();
+        std::cerr << "Replay: the file dialog failed: " << SDL_GetError() << '\n';
         return;
     }
     if (files[0] == nullptr) return; // cancelled
@@ -208,7 +193,7 @@ public:
         window_placement();
         if (restore) {
             auto restored = restore_window(*placement);
-            if (!restored) log(LogLevel::warning) << "Window settings: " << restored.error().message;
+            if (!restored) std::cerr << "Window settings: " << restored.error().message << '\n';
         }
 #if defined(OPENLF2_HAS_WINDOW_ICON) && SDL_VERSION_ATLEAST(3, 4, 0)
         // Purely cosmetic, so a failure is ignored. SDL_LoadPNG_IO is only available
@@ -225,7 +210,7 @@ public:
         original_size_ = {viewport.width, viewport.height};
         requested_renderer_ = renderer;
         if (!choose_renderer(renderer)) return error();
-        // Avoids tearing, and paces the extra pictures of the "Smooth motion" option to the display (see display_pacing).
+        // Avoids tearing only; the application's frame clock decides when frames run.
         SDL_SetRenderVSync(renderer_.get(), 1);
         make_setup_screen();
         // Controllers are optional too. Ones plugged in before the start are opened here, later
@@ -325,7 +310,7 @@ public:
                 if (auto opened = open_track(command.resource)) {
                     track_ = std::move(*opened);
                 } else if (reported_.insert(command.resource).second) {
-                    log(LogLevel::warning) << "Music " << command.resource << " cannot play: " << opened.error().message;
+                    std::cerr << "Music " << command.resource << " cannot play: " << opened.error().message << '\n';
                 }
                 break;
             case MusicCommand::Kind::stop:
@@ -351,8 +336,15 @@ public:
         for (const auto& sound : sounds) {
             auto voice = voices_.find(sound.resource);
             if (voice == voices_.end()) {
+                if (silent_.contains(sound.resource)) continue;
                 auto loaded = load_voice(sound.resource);
-                if (!loaded) return std::unexpected(loaded.error());
+                if (!loaded) {
+                    // A sound the data names but cannot be played (a mod's missing or non-WAV file)
+                    // stays silent, like the original, instead of stopping the game.
+                    silent_.insert(sound.resource);
+                    std::cerr << "Sound " << sound.resource << " cannot play: " << loaded.error().message << '\n';
+                    continue;
+                }
                 voice = voices_.emplace(sound.resource, std::move(*loaded)).first;
             }
             const double volume_gain = gain(sound.volume);
@@ -591,6 +583,7 @@ public:
     bool rebuild_renderer() {
         setup_.reset();
         textures_.clear();
+        unusable_.clear();
         sprite_effects_.clear();
         texture_bytes_ = 0;
         frame_target_.reset();
@@ -631,7 +624,7 @@ public:
         placement.height = original_size_.second;
         if (!SDL_GetWindowPosition(window_.get(), &placement.x, &placement.y)) return;
         auto restored = restore_window(placement);
-        if (!restored) log(LogLevel::warning) << "Window size: " << restored.error().message;
+        if (!restored) std::cerr << "Window size: " << restored.error().message << '\n';
     }
     // The window corners in viewport coordinates (rounded outward).
     ScreenExtent screen_extent() const {
@@ -657,7 +650,12 @@ public:
         else SDL_StopTextInput(window_.get());
     }
     SetupDialog& setup_dialog() override { return *setup_; }
-    bool supports(RenderFilter filter) const override { return filter != RenderFilter::xbrz || upscaler_ != nullptr; }
+    bool supports(RenderFilter filter) const override {
+#if !SDL_VERSION_ATLEAST(3, 4, 0)
+        if (filter == RenderFilter::sharp) return false;
+#endif
+        return filter != RenderFilter::xbrz || upscaler_ != nullptr;
+    }
     bool supports_text() const override { return TextRenderer::available(); }
     std::string renderer_name() const override {
         const char* name = renderer_ ? SDL_GetRendererName(renderer_.get()) : nullptr;
@@ -724,30 +722,12 @@ public:
         return {};
     }
     Result<void> set_render_filter(RenderFilter filter) override {
+        // The default, "sharp", needs SDL 3.4; before it, the previous default.
+        if (filter == RenderFilter::sharp && !supports(filter)) filter = RenderFilter::linear;
         if (!supports(filter)) filter = RenderFilter::nearest;
         if (filter == render_filter_) return {};
         render_filter_ = filter;
         return {};
-    }
-    DisplayPacing display_pacing() override {
-        DisplayPacing pacing;
-#ifdef __EMSCRIPTEN__
-        // wait_for_refresh() follows the browser's animation frames (or a 60 Hz timer where it has none).
-        pacing.paced = true;
-#else
-        int vsync = 0;
-        pacing.paced = renderer_ && SDL_GetRenderVSync(renderer_.get(), &vsync) && vsync != 0;
-        if (window_) {
-            const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_.get()));
-            if (mode != nullptr && mode->refresh_rate > 1.0f) pacing.refresh_ms = 1000.0 / static_cast<double>(mode->refresh_rate);
-        }
-#endif
-        return pacing;
-    }
-    void wait_for_refresh() override {
-#ifdef __EMSCRIPTEN__
-        wait_animation_frame();
-#endif
     }
     Result<void> present(std::span<const DrawCommand> commands, const Viewport& viewport) override {
         viewport_ = viewport;
@@ -776,7 +756,7 @@ public:
                            picture.h + static_cast<float>(area.height - viewport.height) * scale_y};
         }
         const bool xbrz = render_filter_ == RenderFilter::xbrz && upscaler_;
-        if (viewport.render_area || xbrz || render_filter_ == RenderFilter::linear) {
+        if (viewport.render_area || xbrz || render_filter_ == RenderFilter::linear || render_filter_ == RenderFilter::sharp) {
             // The frame is drawn 1:1 into a texture, which is then scaled to the window by the shader or,
             // for linear, by the renderer. Scaling the sprites themselves would sample the pixels around
             // each sprite's rectangle in its sheet and show them as a frame around the sprite.
@@ -799,8 +779,7 @@ public:
             if (xbrz) {
                 if (!SDL_SetTextureScaleMode(frame, SDL_SCALEMODE_NEAREST)
                     || !upscaler_->draw(*renderer_, *frame, target)) return error();
-            } else if (!SDL_SetTextureScaleMode(frame, render_filter_ == RenderFilter::linear
-                    ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST)
+            } else if (!SDL_SetTextureScaleMode(frame, scale_mode(render_filter_))
                        || !SDL_RenderTexture(renderer_.get(), frame, nullptr, target)) {
                 return error();
             }
@@ -823,6 +802,14 @@ public:
         return {};
     }
 private:
+    // How the finished frame is scaled to the window by the renderer (xBRZ has its own shader).
+    static SDL_ScaleMode scale_mode(RenderFilter filter) {
+        if (filter == RenderFilter::linear) return SDL_SCALEMODE_LINEAR;
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+        if (filter == RenderFilter::sharp) return SDL_SCALEMODE_PIXELART;
+#endif
+        return SDL_SCALEMODE_NEAREST;
+    }
     // Draws the overlay commands over the whole window, still in viewport coordinates but not
     // clipped to the letterboxed picture: logical presentation is switched off for this pass
     // and replaced by the same scale and centring.
@@ -895,86 +882,124 @@ private:
                 }
                 shadows_drawn = true;
             }
-            if (sprite.lighting && sprite.lighting->character) {
-                auto lit = sprite_effects_.shaded(*renderer_, resources_, sprite);
-                if (!lit) return std::unexpected(lit.error());
-                if (!SDL_SetTextureColorMod(*lit, static_cast<Uint8>(sprite.tint >> 16),
-                    static_cast<Uint8>(sprite.tint >> 8), static_cast<Uint8>(sprite.tint))) return error();
-                const SDL_FRect destination{static_cast<float>(sprite.x) * sprite.scale_x
-                    + static_cast<float>(sprite.translate_x) + offset_x, static_cast<float>(sprite.y) + offset_y,
-                    static_cast<float>(sprite.source.width) * sprite.scale_x, static_cast<float>(sprite.source.height)};
-                if (!SDL_RenderTexture(renderer_.get(), *lit, nullptr, &destination)) return error();
-                continue;
-            }
-            const auto key = sprite.resource + (sprite.color_key ? ":key" : ":opaque");
-            if (!textures_.contains(key)) {
-                auto bytes = resources_.read(sprite.resource);
-                if (!bytes) return std::unexpected(bytes.error());
-                std::unique_ptr<SDL_IOStream, CloseStream> stream(SDL_IOFromConstMem(bytes->data(), bytes->size()));
-                if (!stream) return error();
-                const bool png = sprite.resource.ends_with(".png");
-#if SDL_VERSION_ATLEAST(3, 4, 0)
-                std::unique_ptr<SDL_Surface, DestroySurface> loaded(
-                    png ? SDL_LoadPNG_IO(stream.get(), false) : SDL_LoadBMP_IO(stream.get(), false));
-#else
-                if (png) return fail(ErrorCode::unsupported, "PNG sprites require SDL 3.4: " + sprite.resource);
-                std::unique_ptr<SDL_Surface, DestroySurface> loaded(SDL_LoadBMP_IO(stream.get(), false));
-#endif
-                if (!loaded) return error();
-                std::unique_ptr<SDL_Surface, DestroySurface> surface(
-                    SDL_ConvertSurface(loaded.get(), png ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_XRGB8888));
-                if (!surface) return error();
-                if (surface->w <= 0 || surface->h <= 0 || surface->w > 8192 || surface->h > 8192) {
-                    return fail(ErrorCode::limit, "image dimensions exceed limits");
-                }
-                const auto texture_bytes = static_cast<std::size_t>(surface->w) * static_cast<std::size_t>(surface->h) * 4;
-                // Bounded cache: drop every retained texture when a limit would be exceeded.
-                // SDL flushes pending draws that use a texture before destroying it.
-                if (texture_bytes > max_texture_bytes) return fail(ErrorCode::limit, "texture memory budget exceeded");
-                if (textures_.size() >= max_textures || texture_bytes > max_texture_bytes - texture_bytes_) {
-                    textures_.clear();
-                    texture_bytes_ = 0;
-                }
-                if (sprite.color_key &&
-                    !SDL_SetSurfaceColorKey(surface.get(), true, SDL_MapSurfaceRGB(surface.get(), 0, 0, 0))) {
-                    return error();
-                }
-                Texture texture(SDL_CreateTextureFromSurface(renderer_.get(), surface.get()));
-                // Sprites are always sampled without filtering; linear scaling happens on the finished frame.
-                if (!texture || !SDL_SetTextureScaleMode(texture.get(), SDL_SCALEMODE_NEAREST)) return error();
-                textures_.emplace(key, std::move(texture));
-                texture_bytes_ += texture_bytes;
-            }
-            const auto& texture = textures_.at(key);
+            // A picture that cannot be read, decoded or uploaded is left out (reported once): one bad picture
+            // in a mod must not stop the game.
+            SDL_Texture* texture = sprite_texture(sprite);
+            if (!texture) continue;
             auto region = sprite.source;
             // A zero rectangle requests the complete image at its natural size.
             if (region.x == 0 && region.y == 0 && region.width == 0 && region.height == 0) {
                 region.width = texture->w;
                 region.height = texture->h;
             }
-            if (region.x < 0 || region.y < 0 || region.width <= 0 || region.height <= 0 ||
-                region.x + region.width > texture->w || region.y + region.height > texture->h) {
-                return fail(ErrorCode::format, "sprite rectangle outside texture: " + sprite.resource);
+            // Only the part of the rectangle inside the picture is drawn. Mods' sheets can be smaller than their
+            // declared cells (rows x columns of w+1 by h+1), and an HP bar for more than 600 HP is wider than its
+            // picture; the original's blit stopped at the edge or drew nothing, it never stopped the game.
+            const int visible_width = std::min(region.width, texture->w - region.x);
+            const int visible_height = std::min(region.height, texture->h - region.y);
+            if (region.x < 0 || region.y < 0 || visible_width <= 0 || visible_height <= 0) {
+                report_once("outside " + sprite.resource, "Picture " + sprite.resource + ": rectangle " + describe(region)
+                            + " is outside the " + std::to_string(texture->w) + "x" + std::to_string(texture->h) + " picture; left out");
+                continue;
+            }
+            const bool cut = visible_width < region.width || visible_height < region.height;
+            if (cut) {
+                report_once("past " + sprite.resource, "Picture " + sprite.resource + ": rectangle " + describe(region)
+                            + " reaches past the " + std::to_string(texture->w) + "x" + std::to_string(texture->h)
+                            + " picture; drawn up to its edge");
+            }
+            // A mirrored (or flipped) picture keeps its far edge in place: the cut-off part was on that side.
+            const float shift_x = sprite.mirrored ? static_cast<float>(region.width - visible_width) * sprite.scale_x : 0.0f;
+            const float shift_y = sprite.flipped ? static_cast<float>(region.height - visible_height) : 0.0f;
+            if (sprite.lighting && sprite.lighting->character && !cut) {
+                // Shading works on the picture's own pixels; when it cannot (a budget, a bad picture), the
+                // sprite is drawn unshaded below.
+                auto lit = sprite_effects_.shaded(*renderer_, resources_, sprite);
+                if (lit) {
+                    if (!SDL_SetTextureColorMod(*lit, static_cast<Uint8>(sprite.tint >> 16),
+                        static_cast<Uint8>(sprite.tint >> 8), static_cast<Uint8>(sprite.tint))) return error();
+                    const SDL_FRect destination{static_cast<float>(sprite.x) * sprite.scale_x
+                        + static_cast<float>(sprite.translate_x) + offset_x, static_cast<float>(sprite.y) + offset_y,
+                        static_cast<float>(sprite.source.width) * sprite.scale_x, static_cast<float>(sprite.source.height)};
+                    if (!SDL_RenderTexture(renderer_.get(), *lit, nullptr, &destination)) return error();
+                    continue;
+                }
+                report_once("shading " + sprite.resource, "Shading " + sprite.resource + ": " + lit.error().message + "; drawn unshaded");
             }
             const SDL_FRect source{static_cast<float>(region.x), static_cast<float>(region.y),
-                                   static_cast<float>(region.width), static_cast<float>(region.height)};
+                                   static_cast<float>(visible_width), static_cast<float>(visible_height)};
             const SDL_FRect destination{static_cast<float>(sprite.x) * sprite.scale_x
-                                            + static_cast<float>(sprite.translate_x) + offset_x,
-                                        static_cast<float>(sprite.y) + offset_y,
+                                            + static_cast<float>(sprite.translate_x) + offset_x + shift_x,
+                                        static_cast<float>(sprite.y) + offset_y + shift_y,
                                         source.w * sprite.scale_x, source.h};
             // The tint multiplies the texture's colors (SDL keeps it on the texture, so set it every draw).
-            if (!SDL_SetTextureColorMod(texture.get(), static_cast<Uint8>((sprite.tint >> 16) & 0xff),
+            if (!SDL_SetTextureColorMod(texture, static_cast<Uint8>((sprite.tint >> 16) & 0xff),
                                         static_cast<Uint8>((sprite.tint >> 8) & 0xff), static_cast<Uint8>(sprite.tint & 0xff))) {
                 return error();
             }
             const auto flip = static_cast<SDL_FlipMode>((sprite.mirrored ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE)
                                                         | (sprite.flipped ? SDL_FLIP_VERTICAL : SDL_FLIP_NONE));
-            if (!SDL_RenderTextureRotated(renderer_.get(), texture.get(), &source, &destination, 0.0, nullptr, flip)) {
+            if (!SDL_RenderTextureRotated(renderer_.get(), texture, &source, &destination, 0.0, nullptr, flip)) {
                 return error();
             }
         }
         if (clipped && !SDL_SetRenderClipRect(renderer_.get(), nullptr)) return error();
         return {};
+    }
+    // Reports a problem once per `key` (a picture and what is wrong with it), whatever the numbers in the message.
+    void report_once(const std::string& key, const std::string& message) {
+        if (reported_.size() < 256 && reported_.insert(key).second) std::cerr << message << '\n';
+    }
+    static std::string describe(const Rectangle& area) {
+        return std::to_string(area.x) + "," + std::to_string(area.y) + " " + std::to_string(area.width) + "x"
+            + std::to_string(area.height);
+    }
+    // The sprite's picture as a texture, from the bounded cache or loaded now; null when it cannot be read,
+    // decoded or uploaded (reported once, then not tried again).
+    SDL_Texture* sprite_texture(const SpriteCommand& sprite) {
+        const auto key = sprite.resource + (sprite.color_key ? ":key" : ":opaque");
+        if (const auto found = textures_.find(key); found != textures_.end()) return found->second.get();
+        if (unusable_.contains(key)) return nullptr;
+        const auto failed = [&](const std::string& why) -> SDL_Texture* {
+            if (unusable_.size() < 4096) unusable_.insert(key);
+            report_once("load " + sprite.resource, "Picture " + sprite.resource + ": " + why + "; left out");
+            return nullptr;
+        };
+        auto bytes = resources_.read(sprite.resource);
+        if (!bytes) return failed(bytes.error().message);
+        std::unique_ptr<SDL_IOStream, CloseStream> stream(SDL_IOFromConstMem(bytes->data(), bytes->size()));
+        if (!stream) return failed(SDL_GetError());
+        const bool png = sprite.resource.ends_with(".png");
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+        std::unique_ptr<SDL_Surface, DestroySurface> loaded(
+            png ? SDL_LoadPNG_IO(stream.get(), false) : SDL_LoadBMP_IO(stream.get(), false));
+#else
+        if (png) return failed("PNG sprites require SDL 3.4");
+        std::unique_ptr<SDL_Surface, DestroySurface> loaded(SDL_LoadBMP_IO(stream.get(), false));
+#endif
+        if (!loaded) return failed(SDL_GetError());
+        std::unique_ptr<SDL_Surface, DestroySurface> surface(
+            SDL_ConvertSurface(loaded.get(), png ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_XRGB8888));
+        if (!surface) return failed(SDL_GetError());
+        if (surface->w <= 0 || surface->h <= 0 || surface->w > 8192 || surface->h > 8192) {
+            return failed("image dimensions exceed limits");
+        }
+        const auto texture_bytes = static_cast<std::size_t>(surface->w) * static_cast<std::size_t>(surface->h) * 4;
+        if (texture_bytes > max_texture_bytes) return failed("texture memory budget exceeded");
+        // Bounded cache: drop every retained texture when a limit would be exceeded.
+        // SDL flushes pending draws that use a texture before destroying it.
+        if (textures_.size() >= max_textures || texture_bytes > max_texture_bytes - texture_bytes_) {
+            textures_.clear();
+            texture_bytes_ = 0;
+        }
+        if (sprite.color_key && !SDL_SetSurfaceColorKey(surface.get(), true, SDL_MapSurfaceRGB(surface.get(), 0, 0, 0))) {
+            return failed(SDL_GetError());
+        }
+        Texture texture(SDL_CreateTextureFromSurface(renderer_.get(), surface.get()));
+        // Sprites are always sampled without filtering; linear scaling happens on the finished frame.
+        if (!texture || !SDL_SetTextureScaleMode(texture.get(), SDL_SCALEMODE_NEAREST)) return failed(SDL_GetError());
+        texture_bytes_ += texture_bytes;
+        return textures_.emplace(key, std::move(texture)).first->second.get();
     }
     // The text's cached texture, placed by its alignment; a background box is the text's width plus a pixel.
     Result<void> draw_text(const TextCommand& command, float offset_x, float offset_y) {
@@ -982,7 +1007,7 @@ private:
         auto texture = text_.texture(*renderer_, command);
         if (!texture) {
             // A text that cannot be rendered is reported once and left out; it must not stop the game.
-            if (reported_.insert(texture.error().message).second) log(LogLevel::warning) << "Text: " << texture.error().message;
+            if (reported_.insert(texture.error().message).second) std::cerr << "Text: " << texture.error().message << '\n';
             return {};
         }
         const auto width = static_cast<float>((*texture)->w);
@@ -1207,7 +1232,7 @@ private:
             auto count = track_->read(samples);
             if (!count) {
                 if (reported_.insert(music_resource_).second) {
-                    log(LogLevel::warning) << "Music " << music_resource_ << " stopped: " << count.error().message;
+                    std::cerr << "Music " << music_resource_ << " stopped: " << count.error().message << '\n';
                 }
                 track_.reset();
                 return {};
@@ -1270,6 +1295,7 @@ private:
     static constexpr std::size_t max_textures = 256;
     static constexpr std::size_t max_texture_bytes = 128 * 1024 * 1024;
     std::map<std::string, Texture, std::less<>> textures_;
+    std::set<std::string, std::less<>> unusable_; // texture keys whose picture could not be loaded
     std::size_t texture_bytes_ = 0;
     // Voices are destroyed before the device closes (members are destroyed in reverse order).
     std::unique_ptr<CloseAudioDevice> audio_;
@@ -1286,6 +1312,7 @@ private:
     std::string music_resource_;
     bool music_running_ = false;
     std::set<std::string, std::less<>> reported_;
+    std::set<std::string, std::less<>> silent_; // sounds that cannot be loaded
 };
 }
 Result<std::filesystem::path> settings_directory() {

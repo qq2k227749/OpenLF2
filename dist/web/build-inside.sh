@@ -3,7 +3,7 @@ set -euo pipefail
 
 lua_root=/workspace/build/web/vendor/lua-5.2.4
 ffmpeg_root=/workspace/build/web/vendor/ffmpeg-7.1.5
-sdl_root=/workspace/build/web/vendor/SDL3-3.4.18
+sdl_root=/workspace/build/web/vendor/SDL3-3.4.14
 freetype_root=/workspace/build/web/vendor/freetype-2.13.2
 sdl_ttf_root=/workspace/build/web/vendor/SDL3_ttf-3.2.2
 prefix=/workspace/build/web/prefix
@@ -50,7 +50,8 @@ if [[ ! -f "$prefix/lib/libavformat.a" ]]; then
             --disable-asm --disable-autodetect --disable-network --disable-pthreads \
             --disable-doc --disable-programs --disable-avdevice --disable-avfilter \
             --disable-postproc --disable-everything --disable-shared --enable-static \
-            --enable-decoder=wmav2 --enable-demuxer=asf --enable-swresample
+            --enable-decoder=wmav1,wmav2,wmapro,mp3float,mp3 --enable-demuxer=asf,mp3 --enable-parser=mpegaudio \
+            --enable-swresample
         make -j4
         make install
     )

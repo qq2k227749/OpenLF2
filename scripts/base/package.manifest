@@ -46,6 +46,7 @@ module=ui/ending|ui/ending.lua
 module=game/music|game/music.lua
 module=game/recording|game/recording.lua
 module=game/speed|game/speed.lua
+module=game/room|game/room.lua
 module=game/network|game/network.lua
 module=ui/network|ui/network.lua
 module=i18n/i18n|i18n/i18n.lua

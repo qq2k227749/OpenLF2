@@ -75,6 +75,9 @@
   button#start:disabled { background: #4a5079; color: #9aa1c4; }
   button#fullscreen { padding: .65rem 1.2rem; font-size: .92rem; }
   #chosen { flex: 1 1 10rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); font-size: .88rem; }
+  .game-choice { display: flex; align-items: center; gap: .5rem; color: var(--text-dim); font-size: .92rem; }
+  select#game { font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--card-border); border-radius: 999px;
+    padding: .55rem .9rem; max-width: 22rem; }
   progress#progress { display: block; width: 100%; height: .6rem; margin-top: .9rem; accent-color: var(--accent); }
   progress#progress[hidden] { display: none; }
   @media (max-width: 480px) { .wrap { padding: 0 1rem; } #play { padding: 1.25rem; } }
@@ -91,6 +94,14 @@
   .stage:-webkit-full-screen { width: 100vw; height: 100vh; height: 100dvh; border: 0; border-radius: 0; margin: 0; display: flex; }
   .stage:fullscreen canvas#canvas { width: 100% !important; height: 100% !important; aspect-ratio: auto; }
   .stage:-webkit-full-screen canvas#canvas { width: 100% !important; height: 100% !important; aspect-ratio: auto; }
+  /* Large view (while playing, unless turned off): the stage leaves the text column and takes as much of the
+     window as fits, centred; the game scales up with its upscaling filter (Options). */
+  .stage.wide { width: min(calc(100vw - 2rem), calc((100vh - 1.5rem) * 794 / 550)); left: 50%; transform: translateX(-50%); }
+  @supports (height: 100dvh) {
+    .stage.wide { width: min(calc(100vw - 2rem), calc((100dvh - 1.5rem) * 794 / 550)); }
+  }
+  .stage.wide:fullscreen { left: 0; transform: none; width: 100vw; }
+  .stage.wide:-webkit-full-screen { left: 0; transform: none; width: 100vw; }
   details { margin-top: 1rem; }
   details summary { cursor: pointer; color: var(--text-dim); font-size: .85rem; }
   details pre { max-height: 10rem; overflow: auto; white-space: pre-wrap; font-size: .78rem; background: #000; border-radius: 8px; padding: .6rem .8rem; color: #9fe6ff; }
@@ -111,7 +122,6 @@
         <a class="btn primary" href="#play">Play in your browser</a>
         <a class="btn secondary" href="https://github.com/OpenLF2/OpenLF2">View source on GitHub</a>
         <a class="btn secondary" href="https://github.com/OpenLF2/OpenLF2/releases">Download</a>
-        <a class="btn secondary" href="https://openlf2.github.io/OpenLF1/">Visit OpenLF1</a>
       </div>
     </div>
   </header>
@@ -136,7 +146,7 @@
         </div>
         <div class="card">
           <h3>Network play</h3>
-          <p>Network matches between OpenLF2 players over TCP; original LF2 compatibility is not supported.</p>
+          <p>Network matches between OpenLF2 players over TCP, or through a relay in the browser; original LF2 compatibility is not supported.</p>
         </div>
         <div class="card">
           <h3>Moddable</h3>
@@ -154,15 +164,23 @@
     <section id="play">
       <h2>Play in your browser</h2>
       <p class="lede">This build runs entirely on your device. Press <b>Start game</b> to download the original
-        LF2 v2.0a game data from archive.org (about 30&nbsp;MB, checked by SHA-256), or select your own
+        LF2 v2.0a game data (about 30&nbsp;MB, checked by SHA-256) from the online relay when it keeps a copy, else
+        from archive.org, or select your own
         <code>LF2_v2.0a.exe</code> or <code>lf2_v20a_Setup.exe</code> installer manually. Your browser
         saves the installer for future visits; a selected file is never uploaded anywhere.</p>
+      <p class="lede">Mods that come as a whole game folder (their own program, data and pictures) can be played too:
+        pick one in <b>Game</b> (the online relay keeps them), or select its <code>.zip</code> file. Everyone in a network
+        room must play the same game; invite links carry the choice.</p>
 
       <div class="play-controls">
+        <label class="game-choice">Game <select id="game" aria-label="Game to play">
+          <option value="">LF2 v2.0a (original)</option>
+        </select></label>
         <button id="choose" class="btn secondary" type="button">Select file manually…</button>
-        <input id="installer" type="file" accept=".exe,application/octet-stream" aria-label="LF2 v2.0a installer" hidden>
+        <input id="installer" type="file" accept=".exe,.zip,application/octet-stream,application/zip" aria-label="LF2 v2.0a installer or a mod's ZIP file" hidden>
         <span id="chosen" hidden></span>
         <button id="start" class="btn" disabled>Start game</button>
+        <button id="wide" class="btn secondary" type="button" hidden aria-pressed="true">Normal view</button>
         <button id="fullscreen" class="btn secondary" type="button" hidden>Fullscreen</button>
       </div>
       <progress id="progress" hidden></progress>
@@ -184,12 +202,15 @@
         <a href="https://github.com/OpenLF2/OpenLF2">GitHub</a>
         <a href="https://github.com/OpenLF2/OpenLF2/blob/main/LICENSE">MIT License</a>
         <a href="licenses/THIRD-PARTY-NOTICES.md">Third-party notices</a>
-        <a href="https://openlf2.github.io/OpenLF1/">OpenLF1</a>
       </div>
     </div>
   </footer>
 
 <script src="installer-store.js"></script>
+<!-- Network play through a relay (online.js). This site's default relay, so that players who open the site
+     without an invite link find it set (and its mods listed); a relay typed on the page or in a link wins. -->
+<script>window.OPENLF2_RELAY = 'wss://sybilproxy.com/lf2-relay/relay';</script>
+<script src="online.js"></script>
 <script>
   const installer = document.getElementById('installer');
   const start = document.getElementById('start');
@@ -201,6 +222,24 @@
   let started = false;
   let selectionChanged = false;
 
+  // Large view: on by default while playing; the choice is remembered.
+  const stage = document.getElementById('stage');
+  const wideButton = document.getElementById('wide');
+  let wide = true;
+  try { wide = localStorage.getItem('openlf2-wide') !== '0'; } catch (error) { /* storage unavailable */ }
+  function applyWide(scroll) {
+    stage.classList.toggle('wide', wide && started);
+    wideButton.textContent = wide ? 'Normal view' : 'Large view';
+    wideButton.setAttribute('aria-pressed', String(wide));
+    window.dispatchEvent(new Event('resize'));
+    if (scroll && wide) stage.scrollIntoView({block: 'center', behavior: 'smooth'});
+  }
+  wideButton.addEventListener('click', () => {
+    wide = !wide;
+    try { localStorage.setItem('openlf2-wide', wide ? '1' : '0'); } catch (error) { /* storage unavailable */ }
+    applyWide(true);
+    canvas.focus({preventScroll: true});
+  });
   const fullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement;
   const canFullscreen = !!(document.fullscreenEnabled || document.webkitFullscreenEnabled);
   if (canFullscreen) {
@@ -242,7 +281,89 @@
   function update() {
     start.disabled = !ready || started || downloading;
     chooseButton.disabled = started || downloading;
+    // Another game can be chosen while one runs: the page then reloads into it (see the change handler).
+    gameSelect.disabled = downloading;
   }
+
+  // The game to play: the original LF2 (""), a mod the relay keeps ("pack:<id>") or a mod's ZIP file from this
+  // computer ("file"). The choice is remembered, an invite link's ?pack= wins, and invite links carry it.
+  const gameSelect = document.getElementById('game');
+  const pageParams = new URLSearchParams(location.search);
+  let packList = [];
+  let pendingPack = null; // a mod's ZIP file just selected
+  function addOption(value, label) {
+    let option = [...gameSelect.options].find(item => item.value === value);
+    if (!option) {
+      option = document.createElement('option');
+      option.value = value;
+      gameSelect.appendChild(option);
+    }
+    option.textContent = label;
+    return option;
+  }
+  function selectGame(value) {
+    if (value && ![...gameSelect.options].some(item => item.value === value)) {
+      addOption(value, value.startsWith('pack:') ? value.slice(5) + ' (mod)' : 'Mod file on this computer');
+    }
+    gameSelect.value = value;
+    try { localStorage.setItem('openlf2-game', value); } catch (error) { /* storage unavailable */ }
+    if (window.OpenLF2Online) OpenLF2Online.pack = value.startsWith('pack:') ? value.slice(5) : '';
+    // An invite link's address follows the choice, so that reloading it keeps the game chosen last.
+    const address = new URL(location.href);
+    if (address.searchParams.has('room') || address.searchParams.has('pack')) {
+      if (value.startsWith('pack:')) address.searchParams.set('pack', value.slice(5));
+      else address.searchParams.delete('pack');
+      if (address.href !== location.href) history.replaceState(history.state, '', address.href);
+    }
+  }
+  let runningGame = null; // the game running in this page ("" for the original), once one runs
+  gameSelect.addEventListener('change', () => {
+    const value = gameSelect.value;
+    if (runningGame === null) {
+      selectionChanged = true;
+      selectGame(value);
+      return;
+    }
+    if (value === runningGame) return;
+    // A running game cannot swap its data: the page reloads into the new choice, which then starts by itself
+    // when this browser keeps it (else Start game downloads it). An invite link's ?pack= follows the choice.
+    const title = gameSelect.selectedOptions[0] ? gameSelect.selectedOptions[0].textContent : value;
+    if (!confirm('Switch to ' + title + '? The page reloads and the game running now stops.')) {
+      gameSelect.value = runningGame;
+      canvas.focus({preventScroll: true});
+      return;
+    }
+    selectGame(value);
+    const url = new URL(location.href);
+    if (value.startsWith('pack:')) url.searchParams.set('pack', value.slice(5));
+    else url.searchParams.delete('pack');
+    if (url.href === location.href) location.reload();
+    else location.replace(url.href);
+  });
+  {
+    let initial = '';
+    try { initial = localStorage.getItem('openlf2-game') || ''; } catch (error) { /* storage unavailable */ }
+    const invited = (pageParams.get('pack') || '').toLowerCase();
+    if (/^[a-z0-9][a-z0-9-]{0,39}$/.test(invited)) initial = 'pack:' + invited;
+    else if (pageParams.has('room')) initial = initial === 'file' ? 'file' : '';
+    selectGame(initial);
+  }
+  const packsLoaded = (async () => {
+    const url = window.OpenLF2Online && OpenLF2Online.packsUrl();
+    if (!url) return;
+    try {
+      const response = await fetch(url, {cache: 'no-store'});
+      if (!response.ok) return;
+      packList = ((await response.json()).packs || []).filter(pack => pack && /^[a-z0-9][a-z0-9-]{0,39}$/.test(pack.id));
+      for (const pack of packList) addOption('pack:' + pack.id, pack.title + ' (mod, ' + Math.round(pack.size / 1e6) + ' MB)');
+    } catch (error) {
+      message('Mods on the relay unavailable: ' + error);
+    }
+  })();
+  packStore.load('file').then(record => {
+    if (record && record.blob) addOption('file', record.title + ' (mod file on this computer)');
+  }).catch(() => {});
+
   const cachedInstaller = installerStore.load().catch(error => {
     message('Browser installer storage unavailable: ' + error);
     return null;
@@ -254,22 +375,44 @@
     onAbort: reason => { status.textContent = 'Game stopped: ' + reason; },
     onRuntimeInitialized: () => {
       ready = true;
-      status.textContent = 'Checking for a saved installer…';
+      status.textContent = 'Checking for saved game data…';
       update();
-      cachedInstaller.then(file => {
-        if (started || selectionChanged) {
-          if (!started) status.textContent = 'Ready. Start the game with your selected installer.';
-        } else if (file) {
-          launch(file, false);
-        } else {
-          status.textContent = 'Ready. Press Start to download the game data from archive.org, or select your installer manually.';
-        }
-      });
+      autoStart();
     }
   };
+  // Starts at once when the chosen game is already saved in this browser.
+  async function autoStart() {
+    const game = gameSelect.value;
+    if (game.startsWith('pack:') || game === 'file') {
+      await packsLoaded;
+      const record = await packStore.load(game === 'file' ? 'file' : game).catch(() => null);
+      const listed = packList.find(pack => 'pack:' + pack.id === game);
+      const current = record && record.blob && (game === 'file' || !listed || !listed.sha256 || record.sha256 === listed.sha256);
+      if (started || selectionChanged || downloading) return;
+      if (current) return launchPack(record.blob, record.title);
+      status.textContent = 'Ready. Press Start game to download the chosen mod' + (listed ? ' (' + (listed.size / 1e6).toFixed(0) + ' MB, once).' : '.');
+      return;
+    }
+    const file = await cachedInstaller;
+    if (started || selectionChanged || downloading) {
+      if (!started && !downloading) status.textContent = 'Ready. Start the game with your selection.';
+    } else if (file) {
+      launch(file, false);
+    } else {
+      status.textContent = 'Ready. Press Start game to download the game data, or select your installer manually.';
+    }
+  }
+  function running() {
+    Module.canvas.focus({preventScroll: true});
+    if (canFullscreen) fullscreenButton.hidden = false;
+    wideButton.hidden = false;
+    applyWide(true);
+  }
   async function launch(file, saveSelection) {
     if (!ready || started) return;
     started = true;
+    runningGame = '';
+    gameSelect.value = '';
     update();
     try {
       status.textContent = 'Loading installer into browser memory…';
@@ -287,11 +430,10 @@
       }
       Module.FS.mkdir('/data');
       Module.FS.writeFile('/data/LF2_v2.0a.exe', bytes);
-      status.textContent = saved ? 'Running OpenLF2' :
+      status.textContent = saved ? 'Running LF2 v2.0a. To play a mod instead, choose it under Game.' :
         'Running OpenLF2. Browser storage is unavailable; select the installer again next visit.';
       Module.callMain(['--config-dir', '/data']);
-      Module.canvas.focus({preventScroll: true});
-      if (canFullscreen) fullscreenButton.hidden = false;
+      running();
     } catch (error) {
       if (!saveSelection) {
         try { await installerStore.remove(); }
@@ -300,6 +442,29 @@
       status.textContent = 'Could not start: ' + error.message;
       message(String(error));
       started = false;
+      runningGame = null;
+      update();
+    }
+  }
+  // Runs a mod: its ZIP file goes into the game's memory as /data/game.zip (the game's --pack option).
+  async function launchPack(blob, title) {
+    if (!ready || started) return;
+    started = true;
+    runningGame = gameSelect.value;
+    update();
+    try {
+      status.textContent = 'Loading ' + title + ' into browser memory…';
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      Module.FS.mkdir('/data');
+      Module.FS.writeFile('/data/game.zip', bytes, {canOwn: true});
+      status.textContent = 'Running ' + title + '. To play another game, choose it under Game.';
+      Module.callMain(['--config-dir', '/data', '--pack', '/data/game.zip']);
+      running();
+    } catch (error) {
+      status.textContent = 'Could not start: ' + error.message;
+      message(String(error));
+      started = false;
+      runningGame = null;
       update();
     }
   }
@@ -313,20 +478,76 @@
     const file = installer.files[0];
     chosen.hidden = !file;
     chosen.textContent = file ? file.name : '';
+    // A ZIP file is a mod; anything else is taken for the installer.
+    pendingPack = file && /\.zip$/i.test(file.name) ? file : null;
+    if (pendingPack) {
+      addOption('file', file.name + ' (mod file on this computer)');
+      selectGame('file');
+    } else if (file) {
+      selectGame('');
+    }
     update();
   });
-  // With no file selected, Start downloads the installer first and then runs it.
+  function showProgress(received, total, what) {
+    progress.max = total || received || 1;
+    progress.value = received;
+    status.textContent = 'Downloading ' + what + ': ' + (received / 1e6).toFixed(1) + (total ? ' / ' + (total / 1e6).toFixed(1) : '') + ' MB';
+  }
+  // A mod the relay keeps: from this browser's storage when it is the relay's current version, else downloaded once.
+  async function startPack(id) {
+    await packsLoaded;
+    const listed = packList.find(pack => pack.id === id);
+    let record = await packStore.load('pack:' + id).catch(() => null);
+    if (record && listed && listed.sha256 && record.sha256 !== listed.sha256) record = null;
+    if (!record || !record.blob) {
+      if (!listed) throw new Error('the relay does not have the mod "' + id + '" (ask the host which one to choose)');
+      downloading = true;
+      progress.hidden = false;
+      update();
+      try {
+        const blob = await packDownload(OpenLF2Online.packUrl(id), listed, (received, total) => showProgress(received, total, listed.title));
+        record = {blob, title: listed.title, sha256: listed.sha256 || '', saved: Date.now()};
+        try {
+          status.textContent = 'Saving ' + listed.title + ' in browser storage…';
+          await packStore.save('pack:' + id, record);
+        } catch (error) {
+          message('Could not save the mod in browser storage: ' + error);
+        }
+      } finally {
+        downloading = false;
+        progress.hidden = true;
+      }
+    }
+    await launchPack(record.blob, record.title);
+  }
   async function startGame() {
+    const game = gameSelect.value;
+    try {
+      if (game.startsWith('pack:')) return await startPack(game.slice(5));
+      if (game === 'file') {
+        let record = null;
+        if (pendingPack) {
+          record = {blob: pendingPack, title: pendingPack.name.replace(/\.zip$/i, ''), sha256: '', saved: Date.now()};
+          try { await packStore.save('file', record); }
+          catch (error) { message('Could not save the mod in browser storage: ' + error); }
+        } else {
+          record = await packStore.load('file').catch(() => null);
+        }
+        if (!record || !record.blob) throw new Error('select the mod\'s .zip file with "Select file manually…" first');
+        return await launchPack(record.blob, record.title);
+      }
+    } catch (error) {
+      update();
+      status.textContent = 'Could not start: ' + error.message;
+      message(String(error));
+      return;
+    }
     if (installer.files.length) return launch(installer.files[0], true);
     downloading = true;
     progress.hidden = false;
     update();
     try {
-      const blob = await installerDownload((received, total) => {
-        progress.max = total;
-        progress.value = received;
-        status.textContent = 'Downloading LF2 v2.0a from archive.org: ' + (received / 1e6).toFixed(1) + ' / ' + (total / 1e6).toFixed(1) + ' MB';
-      });
+      const blob = await installerDownload((received, total, source) => showProgress(received, total, 'LF2 v2.0a game data from ' + source));
       downloading = false;
       progress.hidden = true;
       await launch(blob, true);
@@ -334,7 +555,7 @@
       downloading = false;
       progress.hidden = true;
       update();
-      status.textContent = 'Download failed. Select your installer manually, then start the game.';
+      status.textContent = 'Download failed. If a download manager (such as IDM) opened, let it save the file, then press "Select file manually…", choose it and start the game.';
       message(String(error));
     }
   }

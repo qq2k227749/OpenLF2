@@ -35,7 +35,8 @@ struct Viewport {
 };
 // How the frame is scaled to the window. `xbrz` is an edge-directed pixel-art scaler that runs as
 // a shader, so only some renderers offer it (Platform::supports).
-enum class RenderFilter { nearest, linear, xbrz };
+// sharp: SDL 3.4's pixel-art scaling, crisp pixels of even size at any zoom (OpenLF2 extension).
+enum class RenderFilter { nearest, linear, xbrz, sharp };
 // Optional CPU lighting for world sprites. Screen Y grows downward; ground_y is the
 // object's floor row, independent of jump height. Angles are in degrees.
 struct SpriteLighting {
@@ -91,17 +92,6 @@ struct TextCommand {
     std::optional<Rectangle> clip = std::nullopt; // as SpriteCommand::clip
 };
 using DrawCommand = std::variant<SpriteCommand, FillCommand, TextCommand>;
-// The commands [first, last) of a frame move together (a fighter with its shadow and label, a scrolling background
-// layer). `id` names the same thing in every frame; (x, y) is the group's anchor in viewport coordinates, so that
-// the difference of its anchors in two frames is how far the group moved between them. A group without commands only
-// gives its anchor, for a thing that is hidden in this frame.
-struct MotionGroup {
-    std::uint32_t id = 0;
-    int x = 0;
-    int y = 0;
-    std::size_t first = 0;
-    std::size_t last = 0;
-};
 // Restarts a sound from the beginning, one voice per resource. Volume/pan in hundredths of a
 // decibel: volume -10000..0 attenuates; pan > 0 attenuates the left channel, pan < 0 the right.
 struct SoundCommand {
@@ -203,23 +193,12 @@ public:
 struct FileDialogText {
     std::string title, filter, accept;
 };
-// How presenting is paced to the display. `paced`: present() or wait_for_refresh() returns at the display's rate (vsync,
-// the browser's animation frame), so the caller needs no timer. `refresh_ms`: the display's refresh interval when it
-// is known, else 0.
-struct DisplayPacing {
-    bool paced = false;
-    double refresh_ms = 0;
-};
 class Platform {
 public:
     virtual ~Platform() = default;
     virtual InputSnapshot poll() = 0;
     // Commands are drawn in order over the viewport's clear color.
     virtual Result<void> present(std::span<const DrawCommand> commands, const Viewport& viewport) = 0;
-    [[nodiscard]] virtual DisplayPacing display_pacing() { return {}; }
-    // Waits for the next display refresh where present() does not (the browser); called before poll() when pictures
-    // are shown more often than the scripts run. Does nothing elsewhere.
-    virtual void wait_for_refresh() {}
     // Shows or hides the on-screen keyboard where the system has one; `text` of the snapshot
     // only carries typing while it is active.
     virtual void set_text_input(bool active) = 0;

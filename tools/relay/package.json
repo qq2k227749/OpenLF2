@@ -1,0 +1,21 @@
+{
+  "name": "openlf2-online-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket relay for OpenLF2 web players: rooms of up to 8 players by room code, kept in step by the relay, and the game files it serves",
+  "license": "MIT",
+  "main": "server.js",
+  "bin": {
+    "openlf2-relay": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

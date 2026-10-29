@@ -108,29 +108,22 @@ local FrameOpcode = {
     viewport = 1, sprite = 2, fill = 3, overlay = 4, render_area = 5,
     clip = 6, sound = 7, rumble = 8, music = 9, speed = 10,
     render_filter = 11, text_input = 12, replay_drop = 13, fullscreen = 14, action = 15, text = 16, file_dialog = 17, world_sprite = 18,
-
-    motion_begin = 19, motion_end = 20, smooth_motion = 21,
 }
 local RumbleTarget = {gamepad = 0, phone = 1}
 local MusicKind = {play = 0, stop = 1, resume = 2, volume = 3}
-local RenderFilter = {nearest = 0, linear = 1, xbrz = 2}
+local RenderFilter = {nearest = 0, linear = 1, xbrz = 2, sharp = 3}
 local TextAlign = {left = 0, center = 1, right = 2}
 local INVALID_ENUM = -1
 local MAX_FRAME_COMMANDS = 4096
-local MAX_MOTION_GROUPS = 2048
 local frame_batch, previous_size = {}, 0
 local function render(input)
     local size, count = 0, 0
-    local function append(opcode, ...)
+    local function command(opcode, ...)
+        assert(count < MAX_FRAME_COMMANDS, "frame command limit exceeded")
         local fields = select("#", ...)
         frame_batch[size + 1] = opcode
         for index = 1, fields do frame_batch[size + index + 1] = select(index, ...) end
-        size = size + fields + 1
-    end
-    local function command(opcode, ...)
-        assert(count < MAX_FRAME_COMMANDS, "frame command limit exceeded")
-        append(opcode, ...)
-        count = count + 1
+        size, count = size + fields + 1, count + 1
     end
     local context = {}
     -- What the frame has drawn that translated text must be able to restore (see i18n.paint_baked).
@@ -179,29 +172,6 @@ local function render(input)
     function context.text_input(active) command(FrameOpcode.text_input, active) end
     function context.replay_drop(active) command(FrameOpcode.replay_drop, active) end
     function context.fullscreen(active) command(FrameOpcode.fullscreen, active) end
-    -- Smooth motion (OpenLF2 extension): the host may show pictures between two frames, moving every motion group.
-    -- Without it motion() writes nothing, so a frame is exactly what it was before the option existed.
-    local smooth, groups, grouped = false, 0, false
-    function context.smooth_motion(active)
-        smooth = not not active
-        context.smooth = smooth
-        command(FrameOpcode.smooth_motion, smooth)
-    end
-    -- Everything drawn until the next motion() belongs to group `id` (a number that names the same thing in every
-    -- frame), which is at (x, y) in the viewport; the host moves the group by how far that point moved between frames.
-    -- Groups do not count as frame commands.
-    function context.motion(id, x, y)
-        if not smooth then return end
-        if id == nil then
-            if grouped then append(FrameOpcode.motion_end) end
-            grouped = false
-        else
-            groups = groups + 1
-            assert(groups <= MAX_MOTION_GROUPS, "frame motion group limit exceeded")
-            append(FrameOpcode.motion_begin, id, x, y)
-            grouped = true
-        end
-    end
     function context.action(name)
         -- The system's file dialog shows these texts in a translated language; empty ones leave its defaults.
         if name == "replay" then

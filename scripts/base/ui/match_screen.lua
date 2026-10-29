@@ -179,11 +179,7 @@ local function label_font(team)
     return "pe/words0"
 end
 local function glyphs(context, sheet, text, x, y, advance)
-    for position = 1, #text do
-        local code = text:byte(position)
-        context.sprite(sheet, {(code % 16) * 16, math.floor(code / 16) * 16 + 1, 8, 16},
-            x + (position - 1) * advance, y, true)
-    end
+    font.glyphs(context, tonumber(sheet:match("(%d+)$")) or 0, text, x, y, advance)
 end
 
 -- The original passes COLORREF values (0xBBGGRR) to its text routine; font.gdi takes 0xRRGGBB.
@@ -203,10 +199,6 @@ local function draw_item(context, stage, view, entry, bounds, lighting)
     local frame = entry.record.frame(entry.frame)
     local blink = math.abs(entry.blink)
     local camera = view.camera
-    -- The sprite, shadow, labels and sparks move together between two frames (see context.motion); the screen-
-    -- clamped order markers and the hit shake are left out of the anchor.
-    if frame.state == constants.frame_states.team_order_marker then context.motion()
-    else context.motion(entry.index, entry.draw_offset + entry.x - camera, entry.z + entry.y) end
     local casts_shadow = entry.weapon >= 0 and frame.state ~= constants.frame_states.vanishing_ball
        and frame.state ~= constants.frame_states.team_order_marker
        and entry.record.id ~= constants.object_ids.firzen_ball
@@ -483,7 +475,6 @@ function screen.draw(state, context, window_bounds)
     for _, entry in ipairs(view.items) do
         draw_item(context, current.stage, view, entry, passable_bounds, lighting)
     end
-    context.motion()
     context.clip()
     for _, command in ipairs(view.stage or {}) do
         if command[1] == "sprite" then context.sprite(command[2], command[3], command[4], command[5], true)

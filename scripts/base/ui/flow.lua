@@ -56,7 +56,8 @@ function flow.create(options)
     -- OpenLF2's own options (base/game/options), e.g. the unlocked characters.
     user_options.start()
     local state = {active = "launch", title = title.create(options), options = options,
-        launch = require("base/ui/launch").create({menu_seed = options.menu_seed, problem = settings.problem}),
+        launch = require("base/ui/launch").create({menu_seed = options.menu_seed, problem = settings.problem,
+            game_pack = options.game_pack}),
         pointer_x = 0, pointer_y = 0, previous_button = false, volume_frames = 0,
         touch_gamepad = touch_gamepad.create(user_options.current().gamepad, user_options.current().digipad), mouse_touch = false,
         -- Optional mouse input can stand in for touch while testing the on-screen gamepad.
@@ -155,8 +156,10 @@ local function route(state, input, context)
         state.network = require("base/ui/network").create(state.options)
         state.active = "network"
     elseif requested == "network_ready" then
-        unlock.reset_session()
+        local before = unlock.reset_session()
         state.session = state.network.session
+        -- Hidden characters unlocked here (the option or LF2.NET) are unlocked for the whole room.
+        if before.characters == 1 then network.share_unlocked(state.session) end
         controls.replace_names(state.session.names)
         state.title = title.create(state.options)
         if title.set_replay_disabled then title.set_replay_disabled(state.title, true) end
@@ -282,7 +285,6 @@ function flow.draw(state, context)
     -- Fullscreen (OpenLF2 extension): no-op without a real window; reasserted every frame
     -- like the filter above.
     context.fullscreen(shown_options.fullscreen)
-    context.smooth_motion(shown_options.smooth_motion)
     if state.active == "match" and shown_options.battlefield_layout == "expand" then
         screen_module(state.active).draw(screen_state(state), context, state.window_bounds)
     else
@@ -300,7 +302,7 @@ function flow.draw(state, context)
     -- Show FPS (OpenLF2 extension): centered on the statusbar line so it never overlaps the
     -- left-aligned text.
     if shown_options.show_fps and state.fps then
-        local fps_text = "FPS: " .. state.fps .. (state.display_fps and " / " .. state.display_fps or "")
+        local fps_text = "FPS: " .. state.fps
         font.gdi(context, fps_text, math.floor((constants.screen.width - font.gdi_width(fps_text)) / 2), 0x213)
     end
     if state.quit_dialog then quit_dialog.draw(state.quit_dialog, context) end
@@ -308,6 +310,7 @@ end
 local function disconnect(state, message)
     network.close(state.session)
     state.session = nil
+    unlock.end_session()
     controls.replace_names(nil)
     state.active, state.wait_release = "launch", nil
     state.title = title.create(state.options)
@@ -395,11 +398,13 @@ function flow.update(state, raw, context)
         if touched:find(letter, 1, true) and not input[0]:find(letter, 1, true) then input[0] = input[0] .. letter end
     end
     local local_keys = input.keys
+    local left_room = false
     if state.session then
         unlock.observe(input)
-        if not state.session.pending then input.unlock_bits = unlock.take_pending() end
+        if network.takes_unlock_bits(state.session) then input.unlock_bits = unlock.take_pending() end
         if input.keys[virtual_keys.escape] then
             disconnect(state, i18n.tr("Network game disconnected"))
+            left_room = true
         else
             local hp = state.active == "match" and recording.hp_sum(state.match.match) or 0
             local combined, problem = network.exchange(state.session, input, hp)
@@ -438,6 +443,8 @@ function flow.update(state, raw, context)
     end
     if input.keys[virtual_keys.escape] and not state.escape_held then escape_pressed = true end
     state.escape_held = input.keys[virtual_keys.escape] == true
+    -- The Escape that left a network game does not also ask to exit on the launch screen.
+    if left_room then escape_pressed = false end
     local closed_now = false
     if state.quit_dialog then
         -- While the question is open the screen below is frozen.
@@ -484,9 +491,10 @@ function flow.update(state, raw, context)
     end
     music.flush(context)
     recording.tick_status(state.active == "match" and state.match.match.paused)
-    context.speed(speed.fast)
+    -- A relay room paces its own frames (base/game/room): the host asks for ticks as often as it
+    -- can and the session waits for each frame's turn; F5's fast mode cannot speed up a room.
+    context.speed(state.session and network.paced(state.session) or speed.fast)
     -- Show FPS (OpenLF2 extension): measured FPS, nil for a trace unless given; drawn in flow.draw.
     state.fps = input.fps
-    state.display_fps = input.display_fps
 end
 return flow

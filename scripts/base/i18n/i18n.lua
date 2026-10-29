@@ -41,6 +41,8 @@ end
 
 -- True when text is drawn with TrueType fonts.
 function i18n.active() return selected ~= "default" and host_text end
+-- Whether the host can draw TrueType text at all.
+function i18n.host_text() return host_text end
 function i18n.antialias() return antialias end
 
 -- Messages the host or the scripts build with numbers or names in them ("Network accept: system error 10") match a

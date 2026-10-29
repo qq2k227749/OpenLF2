@@ -65,11 +65,22 @@ function unlock.take_marks()
     return bits, unlock.apply_recorded(bits)
 end
 
--- A new network session starts with equal flags and empty word recognizers on both peers.
+-- A new network session starts with equal flags and empty word recognizers on every computer (in a
+-- relay room, hidden characters any of them had unlocked turn on for all: base/game/room). Returns
+-- the flags from before, which come back when the session ends.
+local before_session
 function unlock.reset_session()
     unlock.end_replay()
+    before_session = before_session or {characters = unlock.flags.characters, function_keys = unlock.flags.function_keys}
     unlock.flags.characters, unlock.flags.function_keys = 0, 0
     progress, marked, previous_keys = {0, 0}, {}, {}
+    return {characters = before_session.characters, function_keys = before_session.function_keys}
+end
+function unlock.end_session()
+    if before_session then
+        unlock.flags.characters, unlock.flags.function_keys = before_session.characters, before_session.function_keys
+    end
+    before_session = nil
 end
 
 -- A replay frame's recorded bits (byte 9 of the record) toggle the flags instead.

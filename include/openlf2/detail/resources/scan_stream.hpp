@@ -56,7 +56,9 @@ public:
         return true;
     }
 
-    // %d. A mismatch consumes only whitespace, so the text becomes the next token.
+    // %d. A mismatch consumes only whitespace, so the text becomes the next token. Like the
+    // original's C library, digits accumulate in 32 bits and wrap around, then the sign applies:
+    // mods write values such as "y: 100000000000000000000" that the original reads that way.
     Scan integer(std::int32_t& target) {
         if (!skip_space()) return Scan::end;
         auto cursor = position_;
@@ -66,17 +68,11 @@ public:
             if (cursor != position_) unsupported("sign without digits");
             return Scan::mismatch;
         }
-        std::int64_t value = 0;
+        std::uint32_t value = 0;
         while (cursor < text_.size() && is_digit(text_[cursor])) {
-            value = value * 10 + (text_[cursor++] - '0');
-            if (value > std::int64_t{std::numeric_limits<std::int32_t>::max()} + 1) {
-                unsupported("integer outside 32-bit range");
-            }
+            value = value * 10U + static_cast<std::uint32_t>(text_[cursor++] - '0');
         }
-        if (negative) value = -value;
-        if (value > std::numeric_limits<std::int32_t>::max()) {
-            unsupported("integer outside 32-bit range");
-        }
+        if (negative) value = 0U - value;
         finish(cursor);
         target = static_cast<std::int32_t>(value);
         return Scan::value;

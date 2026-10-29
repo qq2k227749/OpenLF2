@@ -183,9 +183,10 @@ public:
         }
         // One extra output byte detects expansion beyond the declared size.
         Bytes output(expected_size + 1);
-        if (method == Compression::zlib) {
+        if (method == Compression::zlib || method == Compression::deflate) {
             ZlibStream stream;
-            if (inflateInit(&stream.state) != Z_OK) return fail(ErrorCode::dependency, "zlib init failed");
+            const int window = method == Compression::deflate ? -MAX_WBITS : MAX_WBITS;
+            if (inflateInit2(&stream.state, window) != Z_OK) return fail(ErrorCode::dependency, "zlib init failed");
             stream.initialized = true;
             stream.state.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
             stream.state.avail_in = static_cast<uInt>(input.size());
@@ -194,7 +195,8 @@ public:
             const auto status = inflate(&stream.state, Z_FINISH);
             if (status != Z_STREAM_END || stream.state.avail_in != 0 ||
                 stream.state.total_out != expected_size) {
-                return fail(ErrorCode::format, "invalid zlib stream or decoded size");
+                return fail(ErrorCode::format, method == Compression::deflate ? "invalid DEFLATE stream or decoded size"
+                                                                             : "invalid zlib stream or decoded size");
             }
         } else if (method == Compression::bzip2) {
             BzipStream stream;

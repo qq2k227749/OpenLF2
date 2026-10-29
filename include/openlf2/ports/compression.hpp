@@ -8,7 +8,8 @@
 #include <cstdint>
 
 namespace openlf2 {
-enum class Compression : std::uint8_t { stored, zlib, bzip2, nsis_deflate };
+// deflate: a raw DEFLATE stream, as ZIP files store their entries (game packs).
+enum class Compression : std::uint8_t { stored, zlib, bzip2, nsis_deflate, deflate };
 class Decompressor {
 public:
     virtual ~Decompressor() = default;

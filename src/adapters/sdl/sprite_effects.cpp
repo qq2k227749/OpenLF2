@@ -267,8 +267,10 @@ Result<void> SpriteEffects::prepare(SDL_Renderer& renderer, const ResourceSource
         const auto* sprite = std::get_if<SpriteCommand>(&command);
         if (!sprite || sprite->overlay || !sprite->lighting || !sprite->lighting->casts_shadow
             || sprite->lighting->shadow_opacity == 0) continue;
+        // A sprite whose silhouette cannot be made (a rectangle past its picture, a budget) casts no shadow;
+        // it is still drawn, unshaded if need be.
         auto cached = state.get(renderer, resources, *sprite);
-        if (!cached) return std::unexpected(cached.error());
+        if (!cached) continue;
         const auto& entry = **cached;
         const auto bounds = entry.shadow_bounds;
         const int x0 = static_cast<int>(std::floor(static_cast<float>(sprite->x) * sprite->scale_x)) + sprite->translate_x + bounds.x;

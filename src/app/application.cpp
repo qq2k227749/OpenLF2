@@ -7,7 +7,6 @@
 #include "openlf2/engine/compatibility_random.hpp"
 #include "openlf2/ports/digest.hpp"
 #include "openlf2/engine/frame_clock.hpp"
-#include "openlf2/engine/motion_interpolator.hpp"
 #include "openlf2/engine/packages.hpp"
 #include "openlf2/resources/recording.hpp"
 #include <cstdio>
@@ -15,11 +14,11 @@
 #include "openlf2/ports/download.hpp"
 #include "openlf2/ports/platform.hpp"
 #include "openlf2/ports/scripts.hpp"
-#include "openlf2/ports/log.hpp"
 #include "openlf2/resources/background_data.hpp"
 #include "openlf2/resources/stage_data.hpp"
 #include "openlf2/resources/bitmap.hpp"
 #include "openlf2/resources/installer.hpp"
+#include "openlf2/resources/pack.hpp"
 #include "openlf2/resources/object_data.hpp"
 #include <algorithm>
 #include <array>
@@ -57,26 +56,50 @@ void wait_milliseconds(std::uint32_t milliseconds) {
     std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
 #endif
 }
+#ifdef __EMSCRIPTEN__
+// Browsers put the canvas on screen at their display refresh. A requestAnimationFrame loop notes when the page
+// last refreshed, so that frames can start just after a refresh: then each frame stays up for the same whole
+// number of refreshes (two at 60 Hz), where frames started by a timer near a refresh show up once or three times.
+EM_JS(void, openlf2_watch_display, (), {
+    if (globalThis.OpenLF2Display) return;
+    const display = globalThis.OpenLF2Display = {time: -1, count: 0};
+    const refresh = (time) => { display.time = time; display.count += 1; requestAnimationFrame(refresh); };
+    requestAnimationFrame(refresh);
+});
+// Milliseconds since the latest display refresh; -1 before the first.
+EM_JS(double, openlf2_display_age, (), {
+    const display = globalThis.OpenLF2Display;
+    return display && display.time >= 0 ? performance.now() - display.time : -1;
+});
+// Waits for the next display refresh, at most `limit` milliseconds (a hidden page has no refreshes).
+EM_ASYNC_JS(void, openlf2_wait_display, (int limit), {
+    await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        requestAnimationFrame(finish);
+        setTimeout(finish, limit);
+    });
+});
+// Frames at normal speed on the web: started on display refreshes, 33 1/3 ms apart (30 per second, two
+// refreshes at 60 Hz and four at 120 Hz; the original's 33 ms would slip a refresh every 50 frames). A frame
+// due within `slack` after a refresh starts at it, which keeps the frames' place among the refreshes.
+class DisplayPacer {
+public:
+    void restart(double now) { next_ = now; }
+    [[nodiscard]] bool due(double now) {
+        if (now + slack < next_) return false;
+        if (now - next_ > max_lag) next_ = now - max_lag;
+        next_ += step;
+        return true;
+    }
+private:
+    static constexpr double step = 100.0 / 3.0, slack = 4.0, max_lag = 100.0;
+    double next_ = 0;
+};
+#endif
 double elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
-// Events per second over the last quarter second ("Show FPS"): quick to follow changes, 0 when nothing happens.
-class RateMeter {
-public:
-    void event() { ++count_; }
-    void update(double now_ms) {
-        constexpr double window_ms = 250.0;
-        if (now_ms - start_ < window_ms) return;
-        rate_ = static_cast<double>(count_) * 1000.0 / (now_ms - start_);
-        count_ = 0;
-        start_ = now_ms;
-    }
-    [[nodiscard]] long long rate() const { return std::llround(rate_); }
-
-private:
-    unsigned count_ = 0;
-    double start_ = 0.0, rate_ = 0.0;
-};
 // Prefer current-input frames; sustained overload enables one frame of overlap. Fast-forward always overlaps, whatever
 // the draw time: its frames come as fast as they can be made.
 class FramePipeline {
@@ -120,6 +143,7 @@ private:
 
 struct Configuration {
     std::filesystem::path installer;
+    std::optional<std::filesystem::path> pack; // --pack: a game folder as a ZIP file instead of the installer
     std::filesystem::path scripts;
     std::vector<std::filesystem::path> mods;
     std::optional<std::filesystem::path> config_directory; // --config-dir
@@ -246,15 +270,8 @@ Result<std::optional<std::filesystem::path>> find_installer(const std::filesyste
     std::error_code error;
     if (!std::filesystem::is_directory(directory, error)) return std::optional<std::filesystem::path>{};
     std::filesystem::directory_iterator entries(directory, error);
+    if (error) return fail(ErrorCode::io, "cannot list " + directory.string() + ": " + error.message());
     std::vector<std::filesystem::path> matches;
-    if (error) {
-        // Sandboxed titles (PS5) may open files in a directory they cannot list; try the exact
-        // supported names there instead.
-        for (const auto name : installer_names) {
-            auto candidate = directory / std::string(name);
-            if (std::filesystem::is_regular_file(candidate, error)) matches.push_back(std::move(candidate));
-        }
-    }
     for (const auto& entry : entries) {
         const auto name = entry.path().filename().string();
         const bool same_name = std::ranges::any_of(installer_names, [&](std::string_view candidate) {
@@ -272,7 +289,7 @@ Result<std::optional<std::filesystem::path>> find_installer(const std::filesyste
     if (matches.empty()) return std::optional<std::filesystem::path>{};
     return std::optional{matches.front()};
 }
-#if !defined(__SWITCH__) && !defined(OPENLF2_PS5)
+#ifndef __SWITCH__
 // Candidate installer sources; identify_installer verifies content before saving.
 struct InstallerSource {
     std::string_view name;
@@ -332,22 +349,15 @@ Result<std::optional<Bytes>> download_with_progress(SetupDialog& dialog, const D
     return std::optional{std::move(**result)};
 }
 #endif
-// Handles a missing installer. Switch and PS5 show a copy-location screen; other builds offer
+// Handles a missing installer. Switch shows a copy-location screen; other builds offer
 // a download, verify its identity and save it. Nothing when the user closes or declines.
 Result<std::optional<std::filesystem::path>> offer_installer_download(const std::filesystem::path& directory,
                                                                       SetupDialog& dialog) {
     const auto location = directory.string();
-#if defined(__SWITCH__) || defined(OPENLF2_PS5)
-#ifdef OPENLF2_PS5
-    // The title's /data is /user/data in the console's file system, as FTP clients show it; the
-    // sandbox cannot list folders, so a file browser is no help here.
-    const auto copy_location = location.starts_with("/data/") ? "/user" + location : location;
-#else
-    const auto& copy_location = location;
-#endif
+#ifdef __SWITCH__
     const std::array close{std::string("Close")};
     auto shown = dialog.choose("A supported Little Fighter 2 v2.0a installer was not found.\n\n"
-                               "Copy LF2_v2.0a.exe or lf2_v20a_Setup.exe to\n" + copy_location + "\n\nand start OpenLF2 again.", close);
+                               "Copy LF2_v2.0a.exe or lf2_v20a_Setup.exe to\n" + location + "\n\nand start OpenLF2 again.", close);
     if (!shown) return std::unexpected(shown.error());
     return std::optional<std::filesystem::path>{};
 #else
@@ -375,7 +385,7 @@ Result<std::optional<std::filesystem::path>> offer_installer_download(const std:
             if (written) return std::optional{directory / installer_name};
             checked = std::unexpected(written.error());
         }
-        log(LogLevel::warning) << source.name << ": " << checked.error().message;
+        std::cerr << source.name << ": " << checked.error().message << '\n';
         failures += std::string(source.name) + ": " + checked.error().message + "\n";
     }
     auto shown = dialog.choose("The download failed.\n" + failures + "\nPut LF2_v2.0a.exe or lf2_v20a_Setup.exe into\n" + location
@@ -470,10 +480,11 @@ Result<Configuration> configuration(std::span<const std::string> arguments,
             config.renderer = arguments[index];
         }
         else if (argument == "--installer" || argument == "--scripts" || argument == "--mod"
-                 || argument == "--config-dir" || argument == "--replay") {
+                 || argument == "--config-dir" || argument == "--replay" || argument == "--pack") {
             if (++index == arguments.size()) return fail(ErrorCode::format, argument + " needs a path");
             const auto& value = arguments[index];
             if (argument == "--installer") config.installer = value;
+            else if (argument == "--pack") config.pack = std::filesystem::path(value);
             else if (argument == "--scripts") config.scripts = value;
             else if (argument == "--config-dir") config.config_directory = std::filesystem::path(value);
             else if (argument == "--replay") {
@@ -491,7 +502,7 @@ Result<Configuration> configuration(std::span<const std::string> arguments,
 }
 class GameResources final : public ResourceSource {
 public:
-    GameResources(const InstallerArchive& archive, Bytes executable, std::span<const PackageAsset> assets)
+    GameResources(const ResourceSource& archive, Bytes executable, std::span<const PackageAsset> assets)
         : archive_(archive), executable_(std::move(executable)) {
         for (const auto& asset : assets) assets_.emplace(asset.resource, asset);
     }
@@ -518,7 +529,7 @@ public:
         return converted;
     }
 private:
-    const InstallerArchive& archive_;
+    const ResourceSource& archive_;
     Bytes executable_;
     std::map<std::string, PackageAsset, std::less<>> assets_;
 };
@@ -638,12 +649,12 @@ public:
     void offer(const std::filesystem::path& path) {
         auto bytes = read_file(path, 16 * 1024 * 1024);
         if (!bytes) {
-            log(LogLevel::error) << "Replay: cannot read " << path.string() << ": " << bytes.error().message;
+            std::cerr << "Replay: cannot read " << path.string() << ": " << bytes.error().message << '\n';
             pending_ = std::unexpected(bytes.error());
             return;
         }
         pending_ = recording::decode(*bytes, key_, decompressor_);
-        if (!*pending_) log(LogLevel::error) << "Replay: cannot decode " << path.string() << ": " << pending_->error().message;
+        if (!*pending_) std::cerr << "Replay: cannot decode " << path.string() << ": " << pending_->error().message << '\n';
     }
 private:
     FileDirectory& directory_;
@@ -733,7 +744,7 @@ public:
         if (threaded) {
             try { worker_ = std::thread([this] { work(); }); }
             catch (const std::system_error& error) {
-                log(LogLevel::warning) << "Simulation worker: " << error.what() << "; using synchronous execution.";
+                std::cerr << "Simulation worker: " << error.what() << "; using synchronous execution.\n";
             }
         }
 #else
@@ -855,14 +866,15 @@ private:
 Result<void> run(const Configuration& config) {
     std::vector<std::filesystem::path> packages{config.scripts / "base"};
     packages.insert(packages.end(), config.mods.begin(), config.mods.end());
-    log(LogLevel::info) << "loading scripts";
     auto scripts = load_packages(packages);
     if (!scripts) return std::unexpected(scripts.error());
     const auto music_decoder = make_music_decoder();
     // Declared in lifetime order: the window reads resources, which read the archive, which
     // uses the decompressor.
     auto decompressor = make_decompressor();
-    std::unique_ptr<InstallerArchive> archive;
+    // The original installer, or a game pack (--pack) in its place.
+    std::unique_ptr<ResourceSource> archive;
+    std::size_t archive_files = 0;
     LoadedResources game_data;
     // The user configuration: --config-dir, otherwise SDL's per-user directory; headless runs
     // without --config-dir keep it in memory so traces never touch the user's file. On the web,
@@ -878,7 +890,6 @@ Result<void> run(const Configuration& config) {
     } else if (config.headless) {
         settings = make_memory_settings();
     } else {
-        log(LogLevel::info) << "opening settings folder";
         auto directory = settings_directory();
         if (!directory) return std::unexpected(directory.error());
         settings = make_file_settings(std::move(*directory));
@@ -889,27 +900,34 @@ Result<void> run(const Configuration& config) {
     if (!config.headless) {
         const Viewport window{scripts->window.width, scripts->window.height, 0, 0, 0};
         auto placement = load_window_placement(*settings);
-        if (!placement) log(LogLevel::warning) << "Window settings: " << placement.error().message;
-        log(LogLevel::info) << "starting video and input";
+        if (!placement) std::cerr << "Window settings: " << placement.error().message << '\n';
         auto made = make_platform(game_data, window, *music_decoder, config.renderer,
                                   placement ? *placement : std::nullopt);
         if (!made) return std::unexpected(made.error());
         platform = std::move(*made);
-        log(LogLevel::info) << "Renderer: " << platform->renderer_name()
-                  << (platform->supports(RenderFilter::xbrz) ? " (xBRZ upscaling available)" : "");
-        if (!platform->supports_text()) log(LogLevel::info) << "Translated languages unavailable: this build has no SDL3_ttf";
+        std::cout << "Renderer: " << platform->renderer_name()
+                  << (platform->supports(RenderFilter::xbrz) ? " (xBRZ upscaling available)\n" : "\n");
+        if (!platform->supports_text()) std::cout << "Translated languages unavailable: this build has no SDL3_ttf\n";
     }
-    log(LogLevel::info) << "looking for the LF2 installer";
-    auto installer = locate_installer(config, platform ? std::optional{std::ref(platform->setup_dialog())} : std::nullopt);
-    if (!installer) return std::unexpected(installer.error());
-    if (!*installer) {
-        log(LogLevel::error) << "OpenLF2 needs LF2_v2.0a.exe or lf2_v20a_Setup.exe; stopping.";
-        return {};
+    if (config.pack) {
+        auto opened = PackArchive::open(*config.pack, *decompressor);
+        if (!opened) return std::unexpected(opened.error());
+        std::cout << "Game pack " << config.pack->filename().string() << ": " << (*opened)->file_count()
+                  << " files, executable " << (*opened)->executable_name() << '\n';
+        archive_files = (*opened)->file_count();
+        archive = std::move(*opened);
+    } else {
+        auto installer = locate_installer(config, platform ? std::optional{std::ref(platform->setup_dialog())} : std::nullopt);
+        if (!installer) return std::unexpected(installer.error());
+        if (!*installer) {
+            std::cerr << "OpenLF2 needs LF2_v2.0a.exe or lf2_v20a_Setup.exe; stopping.\n";
+            return {};
+        }
+        auto opened = InstallerArchive::open(**installer, *decompressor);
+        if (!opened) return std::unexpected(opened.error());
+        archive_files = (*opened)->file_count();
+        archive = std::move(*opened);
     }
-    log(LogLevel::info) << "opening the LF2 installer";
-    auto opened = InstallerArchive::open(**installer, *decompressor);
-    if (!opened) return std::unexpected(opened.error());
-    archive = std::move(*opened);
     auto executable = archive->read("lf2.exe");
     if (!executable) return std::unexpected(executable.error());
     auto constants = recording_constants(*executable);
@@ -935,10 +953,8 @@ Result<void> run(const Configuration& config) {
     }
     HostRecordings recordings(*recording_directory, constants->first, *decompressor, config.headless);
     if (config.replay) recordings.offer(*config.replay);
-    log(LogLevel::info) << "starting the network and Lua runtime";
     auto network = make_network_transport();
     if (!network) return std::unexpected(network.error());
-    log(LogLevel::info) << "network ready; starting Lua";
     auto runtime = make_script_runtime(config.jit, resources, original_data, random, *settings, recordings, **network);
     if (!runtime) return std::unexpected(runtime.error());
     // Settings are host-generated literals; screens decide what an entry point means.
@@ -947,12 +963,17 @@ Result<void> run(const Configuration& config) {
     const auto identity = sources + (config.jit ? "\nJIT=1" : "\nJIT=0");
     auto profile = sha256(std::span<const char>(identity.data(), identity.size()));
     if (!profile) return std::unexpected(profile.error());
-    const auto network_options = std::string(config.headless ? ", network_trace=true" : "") + ", network_port=" + std::to_string(config.network_port) +
+    auto network_options = std::string(config.headless ? ", network_trace=true" : "") + ", network_port=" + std::to_string(config.network_port) +
         (config.network_role.empty() ? std::string{} : ", network_role=\"" + config.network_role +
             "\", network_address=\"" + config.network_address + "\"");
+#if defined(__EMSCRIPTEN__)
+    // The browser's transport (dist/web/online.js) reaches a relay room of up to 8 players
+    // (base/game/room), not another computer.
+    network_options += ", network_relay=true";
+#endif
     const auto bundle = "local runtime_settings = {menu_seed=" + std::to_string(menu_seed) +
         ", network_profile=\"" + *profile + "\", recording_version=" + std::to_string(constants->second) + network_options +
-#if defined(__SWITCH__) || defined(__vita__) || defined(OPENLF2_PS5)
+#if defined(__SWITCH__) || defined(__vita__)
         ", default_controller=true" +
 #else
         (config.default_controller ? ", default_controller=true" : "") +
@@ -960,14 +981,14 @@ Result<void> run(const Configuration& config) {
         (config.preview_backgrounds ? ", start_screen=\"backgrounds\"" : "") +
         (config.preview_ending ? ", start_screen=\"ending\"" : "") +
         (config.replay ? ", start_screen=\"replay\"" : "") +
-        (config.mouse_touch ? ", mouse_touch=true" : "") + "}\n" + sources;
+        (config.mouse_touch ? ", mouse_touch=true" : "") +
+        // A game pack (--pack) brings its own menu pictures: screens drop what they cut from the original's.
+        (config.pack ? ", game_pack=true" : "") + "}\n" + sources;
     Simulation simulation(std::move(*runtime), !config.headless);
-    log(LogLevel::info) << "loading game scripts";
     auto loaded = simulation.load(bundle);
     if (!loaded) return std::unexpected(loaded.error());
-    if (!config.headless) log(LogLevel::info) << "startup complete; entering the game loop";
     if ((*network)->status() == NetworkStatus::listening) {
-        log(LogLevel::info) << "Network listening on " << config.network_address << ':' << (*network)->local_port();
+        std::cout << "Network listening on " << config.network_address << ':' << (*network)->local_port() << std::endl;
     }
     if (config.headless) {
         // Runs each traced frame (or one idle frame) and loads every drawn resource once.
@@ -1031,7 +1052,7 @@ Result<void> run(const Configuration& config) {
             if (!description) return std::unexpected(description.error());
             std::cout << *description << '\n';
         }
-        std::cout << "Indexed " << archive->file_count() << " files; " << frames.size()
+        std::cout << "Indexed " << archive_files << " files; " << frames.size()
                   << " Lua frame(s), " << loaded_resources.size() << " distinct bitmap resources loaded, "
                   << sound_count << " sound(s) requested from " << played_sounds.size() << " file(s); "
                   << (music_available ? std::to_string(decoded_music.size()) + " music track(s) decoded"
@@ -1046,30 +1067,30 @@ Result<void> run(const Configuration& config) {
     if (!initial_frame) return std::unexpected(initial_frame.error());
     std::optional<ScriptFrame> ready_frame;
     FramePipeline pipeline;
-    log(LogLevel::info) << "Keys come from the Control Settings (" << settings->location()
-              << ", else data/control.txt); F1-F9 are the original's function keys. "
-                 "Close the window to exit.";
+    std::cout << "Keys come from the Control Settings (" << settings->location()
+              << ", else data/control.txt); F1-F9 are the original's function keys.\n"
+                 "Close the window to exit.\n";
     // Script frames (logic and drawing) follow the original 33 ms schedule, independent of
-    // the display refresh rate; events are still pumped on every loop iteration.
+    // the display refresh rate (the web build: 33 1/3 ms on display refreshes, see DisplayPacer);
+    // events are still pumped on every loop iteration.
     const auto origin = std::chrono::steady_clock::now();
     const auto milliseconds = [origin] {
         return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - origin).count());
     };
     FrameClock clock(milliseconds());
+#ifdef __EMSCRIPTEN__
+    openlf2_watch_display();
+    DisplayPacer pacer;
+    bool display_paced = false; // the previous frame started on a display refresh (DisplayPacer)
+#endif
     bool fast = false;
     bool waiting_network = false;
-    // "Smooth motion" (OpenLF2 extension): between two script frames the display shows pictures with the motion groups
-    // part of the way to the next frame, once per display refresh (vsync, else the display's rate, else 60 Hz).
-    const auto precise_milliseconds = [origin] {
-        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - origin).count();
-    };
-    MotionInterpolator motion;
-    bool smooth = false;
-    DisplayPacing pacing;
-    double next_display_ms = 0.0;
-    // "Show FPS" (OpenLF2 extension): script frames run and pictures presented per second.
-    RateMeter logic_rate, display_rate;
+    // "Show FPS" (OpenLF2 extension): an exponential moving average of the real time between
+    // script frames actually run, smoothing single-frame jitter while still reflecting when the
+    // host cannot keep up with the 33/3 ms schedule. 0 until the second frame has a real delta.
+    double measured_fps = 0.0;
+    std::optional<std::uint32_t> last_frame_time_ms;
     // Key-down events gathered across polls until the next script frame (bounded).
     std::vector<int> key_downs;
     // The dialog answers on a poll between two script frames; keep the file until a frame runs.
@@ -1086,14 +1107,10 @@ Result<void> run(const Configuration& config) {
         const auto placement = platform->window_placement();
         if (!placement) return;
         auto saved = save_window_placement(*settings, *placement);
-        if (!saved) log(LogLevel::warning) << "Window settings: " << saved.error().message;
+        if (!saved) std::cerr << "Window settings: " << saved.error().message << '\n';
     };
     while (true) {
-        // With pictures between script frames the loop follows the display, so input is read right after a refresh.
-        if (smooth && !fast && motion.ready()) platform->wait_for_refresh();
         const auto input = platform->poll();
-        logic_rate.update(precise_milliseconds());
-        display_rate.update(precise_milliseconds());
         if (input.chosen_file) chosen_file = input.chosen_file;
         if (input.dropped_file && accept_replay_drop && !dropped_file) {
             const auto& name = *input.dropped_file;
@@ -1132,31 +1149,38 @@ Result<void> run(const Configuration& config) {
         // Drain a queued frame immediately when returning to current-frame
         // rendering. Its input tick was already scheduled and simulated.
         const bool draining = ready_frame && !ready_frame->waiting && !pipeline.active();
-        if (!draining && !waiting_network && !clock.due(milliseconds(), fast)) {
-            if (smooth && !fast && motion.ready()) {
-                const double now_ms = precise_milliseconds();
-                // Paced by vsync or animation frames, only a floor keeps an unthrottled present (a hidden window) from
-                // spinning; otherwise a timer keeps the display's rate.
-                const double period = pacing.paced ? 2.0 : pacing.refresh_ms > 0.0 ? pacing.refresh_ms : 1000.0 / 60.0;
-                if (now_ms < next_display_ms) {
-                    const auto remaining = static_cast<std::uint32_t>(std::ceil(next_display_ms - now_ms));
-                    wait_milliseconds(std::clamp<std::uint32_t>(remaining, 1, FrameClock::max_sleep));
-                } else if (motion.move(clock.progress(now_ms, fast))) {
-                    auto shown = platform->present(motion.commands(), motion.viewport());
-                    if (!shown) return std::unexpected(shown.error());
-                    display_rate.event();
-                    next_display_ms = std::max(next_display_ms + period, now_ms);
-                } else {
-                    wait_milliseconds(1);
-                }
+#ifdef __EMSCRIPTEN__
+        // At normal speed, frames start on display refreshes. F5's fast mode and network rooms keep the timer:
+        // a room polls the network every few milliseconds and starts its frames after a refresh itself (" v").
+        const bool display_frame = !draining && !waiting_network && !fast;
+        if (display_frame) {
+            const double now = emscripten_get_now();
+            if (!display_paced) pacer.restart(now);
+            display_paced = true;
+            if (!pacer.due(now)) {
+                openlf2_wait_display(100);
                 continue;
             }
+        } else {
+            display_paced = false;
+        }
+        if (!display_frame && !draining && !waiting_network && !clock.due(milliseconds(), fast)) {
+#else
+        if (!draining && !waiting_network && !clock.due(milliseconds(), fast)) {
+#endif
             const auto wait = clock.sleep_ms(milliseconds(), fast);
             if (wait > 0) wait_milliseconds(wait);
             continue;
         }
         const auto frame_started = std::chrono::steady_clock::now();
-        if (!waiting_network && !draining) logic_rate.event();
+        if (!waiting_network && !draining) {
+            const auto now_ms = milliseconds();
+            if (last_frame_time_ms && now_ms > *last_frame_time_ms) {
+                const double instant_fps = 1000.0 / static_cast<double>(now_ms - *last_frame_time_ms);
+                measured_fps = measured_fps <= 0.0 ? instant_fps : measured_fps * 0.9 + instant_fps * 0.1;
+            }
+            last_frame_time_ms = now_ms;
+        }
         // Held keys as "k" and comma-separated virtual-key codes, then " m" with the pointer
         // position and left button; scripts map them to players and screens.
         std::string held = "k";
@@ -1231,17 +1255,26 @@ Result<void> run(const Configuration& config) {
             held += " e" + std::to_string(input.screen.left) + ',' + std::to_string(input.screen.top) + ','
                 + std::to_string(input.screen.right) + ',' + std::to_string(input.screen.bottom);
         }
-        // Then " f" and capability letters: x = xBRZ upscaling, w = a real window whose
+        // Then " f" and capability letters: x = xBRZ upscaling, p = pixel-art ("sharp") scaling, w = a real window whose
         // fullscreen state means something to toggle, t = TrueType text for the translated
         // languages. The options page uses these to decide what to offer.
         std::string capabilities;
         if (platform->supports(RenderFilter::xbrz)) capabilities += 'x';
+        if (platform->supports(RenderFilter::sharp)) capabilities += 'p';
         if (platform->supports_fullscreen()) capabilities += 'w';
         if (platform->supports_text()) capabilities += 't';
         if (!capabilities.empty()) held += " f" + capabilities;
-        // Then " s" and " d": script frames and pictures per second over the last quarter second, not the nominal
-        // 33/3 ms tick, for the "Show FPS" option (OpenLF2 extension; the original has no such display).
-        held += " s" + std::to_string(logic_rate.rate()) + " d" + std::to_string(display_rate.rate());
+        // Then " s" and the measured frames per second (an exponential moving average of the
+        // real time between script frames actually run, not the nominal 33/3 ms tick), for the
+        // "Show FPS" option (OpenLF2 extension; the original has no such display).
+        held += " s" + std::to_string(static_cast<long long>(std::lround(measured_fps)));
+#ifdef __EMSCRIPTEN__
+        // Then " v" and how many milliseconds ago the display last refreshed: a network room starts its frames
+        // just after a refresh (base/game/room.lua), as DisplayPacer does at normal speed.
+        if (const double age = openlf2_display_age(); age >= 0) {
+            held += " v" + std::to_string(static_cast<long long>(std::lround(std::min(age, 600000.0))));
+        }
+#endif
         if (pipeline.active() && !ready_frame) {
             // Introduce the bounded queue by retaining one completed frame. The
             // previous image stays on screen; its actions/audio are not repeated.
@@ -1278,7 +1311,6 @@ Result<void> run(const Configuration& config) {
             if (!applied) return std::unexpected(applied.error());
         }
         if (frame->text_input) platform->set_text_input(*frame->text_input);
-        if (frame->smooth_motion) smooth = *frame->smooth_motion;
         accept_replay_drop = frame->replay_drop.value_or(false);
         if (dropped_file) {
             if (accept_replay_drop) recordings.offer(*dropped_file);
@@ -1300,15 +1332,15 @@ Result<void> run(const Configuration& config) {
             if (action == "open_recordings") {
                 if (const auto folder = recording_directory->path()) {
                     auto shown = platform->open_folder(*folder);
-                    if (!shown) log(LogLevel::warning) << "Recording folder: " << shown.error().message;
+                    if (!shown) std::cerr << "Recording folder: " << shown.error().message << '\n';
                 } else {
-                    log(LogLevel::warning) << "Recording folder: recordings are kept in memory in this run";
+                    std::cerr << "Recording folder: recordings are kept in memory in this run\n";
                 }
                 continue;
             }
             if (action == "replay") {
                 auto shown = platform->choose_file(recording_directory->path(), frame->file_dialog.value_or(FileDialogText{}));
-                if (!shown) log(LogLevel::warning) << "Replay: " << shown.error().message;
+                if (!shown) std::cerr << "Replay: " << shown.error().message << '\n';
                 continue;
             }
             if (action == "open_website" || action == "open_original_website"
@@ -1321,28 +1353,28 @@ Result<void> run(const Configuration& config) {
                     : action == "open_original_website" ? "https://lf2.net/"
                     : "https://openlf2.github.io/OpenLF2/";
                 auto shown = platform->open_url(url);
-                if (!shown) log(LogLevel::warning) << "Website: " << shown.error().message;
+                if (!shown) std::cerr << "Website: " << shown.error().message << '\n';
                 continue;
             }
-            log(LogLevel::info) << "Requested screen: " << action << " (not implemented yet)";
+            std::cout << "Requested screen: " << action << " (not implemented yet)\n";
         }
         // All settings, replay offers and window actions above happen while Lua
         // is idle. Resource reads during presentation use immutable archive data
         // and independent decompression streams.
         const bool overlapping = pipeline.active() && !draining;
         if (overlapping) simulation.start(std::move(held));
-        const bool smoothing = smooth && !fast;
-        if (smoothing) {
-            pacing = platform->display_pacing();
-            motion.push(std::move(frame->commands), std::move(frame->motion), frame->viewport);
-            motion.move(clock.progress(precise_milliseconds(), fast));
-        } else {
-            motion.clear();
-        }
-        auto presented = smoothing ? platform->present(motion.commands(), motion.viewport())
-                                   : platform->present(frame->commands, frame->viewport);
+        auto presented = platform->present(frame->commands, frame->viewport);
         if (!presented) return std::unexpected(presented.error());
-        display_rate.event();
+#if defined(__EMSCRIPTEN__)
+        // A page (or a test) that sets globalThis.OpenLF2FrameTimes to an array learns when each frame is shown.
+        EM_ASM({
+            const times = globalThis.OpenLF2FrameTimes;
+            if (Array.isArray(times)) {
+                times.push(performance.now());
+                if (times.length > 2000) times.splice(0, times.length - 1000);
+            }
+        });
+#endif
         auto music = platform->music(frame->music);
         if (!music) return std::unexpected(music.error());
         auto played = platform->play(frame->sounds);
@@ -1350,7 +1382,6 @@ Result<void> run(const Configuration& config) {
         auto rumbled = platform->rumble(frame->rumbles);
         if (!rumbled) return std::unexpected(rumbled.error());
         if (frame->fast) fast = *frame->fast;
-        if (fast) motion.clear();
         // Estimate serial cost even while requests overlap. Exclude blocking
         // simulation time already included in the main-thread elapsed time.
         const double main_ms = elapsed_ms(frame_started) - blocking_simulation_ms;
@@ -1372,12 +1403,9 @@ Result<void> run(const Configuration& config) {
 int run_application(std::span<const std::string> arguments, const std::filesystem::path& directory) {
     try {
         auto config = configuration(arguments, directory);
-        if (!config) {
-            log(LogLevel::error) << config.error().message;
-            return 1;
-        }
+        if (!config) { std::cerr << config.error().message << '\n'; return 1; }
         if (config->help) {
-            std::cout << "openlf2 [--installer PATH] [--scripts DIR] [--mod DIR] [--headless] [--jit|--no-jit]\n"
+            std::cout << "openlf2 [--installer PATH | --pack FILE.zip] [--scripts DIR] [--mod DIR] [--headless] [--jit|--no-jit]\n"
                          "        [--preview-backgrounds] [--preview-ending] [--input-trace FRAMES] [--seed MS]\n"
                          "        [--config-dir DIR] [--replay FILE] [--renderer NAME] [--mouse-touch] [--default-controller] [FILE.lfr]\n"
                          "--mouse-touch (off by default): a held mouse button stands in for one finger on the\n"
@@ -1397,17 +1425,16 @@ int run_application(std::span<const std::string> arguments, const std::filesyste
                          "        (u d l r a b x y s k), ^x types the character x).\n"
                          "Without --installer, LF2_v2.0a.exe or lf2_v20a_Setup.exe is looked up in the configuration directory; when it is\n"
                          "        missing, a window offers to download it there (headless runs need --installer or --config-dir).\n"
+                         "--pack plays a game folder packed as a ZIP file (an LF2 mod with its own executable, data and pictures)\n"
+                         "        instead of the original installer.\n"
                          "Only explicitly selected, trusted local mod packages are supported.\n";
             return 0;
         }
         auto result = run(*config);
-        if (!result) {
-            log(LogLevel::error) << result.error().message;
-            return 1;
-        }
+        if (!result) { std::cerr << result.error().message << '\n'; return 1; }
         return 0;
     } catch (const std::exception& error) {
-        log(LogLevel::error) << "Application failure: " << error.what();
+        std::cerr << "Application failure: " << error.what() << '\n';
         return 1;
     }
 }

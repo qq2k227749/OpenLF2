@@ -35,6 +35,7 @@ function screen.create(options)
         {{"lf2.net", "open_original_website", 16}, {"openlf2.github.io/OpenLF2", "open_website"}},
     }
     return {page = "menu", background = (options.menu_seed or 0) % 13 + 1, nav = navigation.create(), keyboard = false,
+        game_pack = options.game_pack == true,
         display = {}, capture = nil, name_player = 0, previous_keys = {}, credits = credits,
         message = options.problem and note(i18n.tr("Configuration ignored: %s", options.problem))}
 end
@@ -163,9 +164,10 @@ end
 local function options_entry(state, input)
     local pointed = input.pointer_x >= 0x114 and input.pointer_x <= 0x208
         and input.pointer_y >= options_row.top and input.pointer_y <= options_row.bottom
-    if i18n.active() then
+    if i18n.active() or (state.game_pack and i18n.host_text()) then
         -- The letters only spell "options": a translated language draws the label as text like the other captions
-        -- (size and colors of their baked text), centered in the row.
+        -- (size and colors of their baked text), centered in the row; so does a game pack, whose menu picture has
+        -- other letters.
         local size = 18
         add(state, {"text", i18n.tr("options"), 398, math.floor((options_row.top + options_row.bottom) / 2 - 0.63 * size + 0.5),
             nil, pointed and 0xffffff or 0x5a77d8, nil, "center", size})
@@ -194,30 +196,25 @@ local option_rows = {
     {key = "battlefield_layout", label = "Battlefield layout", choices = function() return options.battlefield_layouts end},
     {key = "fullscreen", label = "Fullscreen", available = function(features) return features.window end},
     {key = "show_fps", label = "Show FPS"},
-    {key = "smooth_motion", label = "Smooth motion"},
     {key = "rumble", label = "Rumble"},
     {key = "character_shading", label = "Character shading"},
     {key = "projected_shadows", label = "Projected shadows"},
 }
 local function options_layout(features, values)
-    local panel = {x = 0x93, width = 0x1f4}
-    local available = {}
-    for _, option in ipairs(option_rows) do
-        if not option.available or option.available(features or {}, values or {}) then available[#available + 1] = option end
-    end
-    -- The panel keeps its bottom edge (0x218) and grows upward, the logo above it moving up with it.
-    panel.height = 0x46 + #available * 0x1a + 7 + 0x1a + 0x1d
-    panel.y = math.min(0x90, 0x218 - panel.height)
+    local panel = {x = 0x93, y = 0x90, width = 0x1f4}
     local rows = {}
-    for _, option in ipairs(available) do
-        local y = panel.y + 0x46 + #rows * 0x1a
-        local box = option.choices
-            and {x = panel.x + 0xf3, y = y, width = 0xc0, height = 18}
-            or {x = panel.x + 0x1e, y = y, size = 19}
-        rows[#rows + 1] = {option = option, box = box}
+    for _, option in ipairs(option_rows) do
+        if not option.available or option.available(features or {}, values or {}) then
+            local y = panel.y + 0x46 + #rows * 0x1a
+            local box = option.choices
+                and {x = panel.x + 0xf3, y = y, width = 0xc0, height = 18}
+                or {x = panel.x + 0x1e, y = y, size = 19}
+            rows[#rows + 1] = {option = option, box = box}
+        end
     end
     local button_y = panel.y + 0x46 + #rows * 0x1a + 7
-    return {panel = panel, rows = rows, logo_y = math.min(0x37, panel.y - 85),
+    panel.height = button_y - panel.y + 0x1a + 0x1d
+    return {panel = panel, rows = rows,
         ok = {x = panel.x + 0x5a, y = button_y, width = 0x78, height = 0x1a},
         cancel = {x = panel.x + 0x104, y = button_y, width = 0x78, height = 0x1a}}
 end
@@ -286,8 +283,8 @@ local function checkbox(state, input, box, label, checked, blocked)
 end
 local function options_page(state, input)
     background(state)
+    logo(state, 0x37)
     local layout = options_layout(input.filters, state.options)
-    logo(state, layout.logo_y)
     local panel = layout.panel
     add(state, {"fill", panel.x, panel.y, panel.width, panel.height, 0xa0, 0xa0, 0xc0})
     add(state, {"fill", panel.x + 2, panel.y + 2, panel.width - 4, panel.height - 4, 0x10, 0x20, 0x50})

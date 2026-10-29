@@ -5,15 +5,15 @@
 #include "openlf2/core/json.hpp"
 #include "openlf2/core/files.hpp"
 #include "openlf2_build_info.hpp"
-#include "openlf2/ports/log.hpp"
-#ifdef OPENLF2_PS5
-#include "openlf2/detail/ps5/direct_memory.hpp"
-#endif
 #include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <cstring>
+#include <iostream>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <string>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -186,8 +186,7 @@ int create_bridge_slot(lua_State* state) {
 // Private protocol, matching the fixed-size opcodes in runtime/bootstrap.lua.
 enum class FrameOpcode {
     viewport = 1, sprite, fill, overlay, render_area, clip, sound, rumble,
-    music, speed, render_filter, text_input, replay_drop, fullscreen, action, text, file_dialog, world_sprite,
-    motion_begin, motion_end, smooth_motion
+    music, speed, render_filter, text_input, replay_drop, fullscreen, action, text, file_dialog, world_sprite
 };
 class FrameReader {
 public:
@@ -203,6 +202,38 @@ public:
         return value;
     }
     int integer(int low = -8192, int high = 8192) { return static_cast<int>(number(low, high)); }
+    // A drawing position or size. Objects of a mod can fly far off the stage (thousands of pixels) and a script
+    // can compute a fraction: a fraction is rounded, and a number outside -8192..8192 (never on screen) leaves
+    // the command out (see `dropped`) instead of stopping the game. A value that is no number stays an error.
+    int coordinate(const char* field) {
+        take();
+        const bool numeric = lua_type(state_, -1) == LUA_TNUMBER;
+        const double value = numeric ? lua_tonumber(state_, -1) : 0;
+        lua_pop(state_, 1);
+        if (!numeric) throw std::runtime_error(std::string("invalid numeric frame field: ") + field);
+        if (!std::isfinite(value) || value < -8192 || value > 8192) {
+            if (!dropped_) dropped_field_ = field, dropped_value_ = value;
+            dropped_ = true;
+            return 0;
+        }
+        return static_cast<int>(std::floor(value + 0.5));
+    }
+    Rectangle area(const char* field) {
+        return Rectangle{coordinate(field), coordinate(field), coordinate(field), coordinate(field)};
+    }
+    // True once per command whose positions could not be drawn (and forgets it); reports each kind once.
+    bool dropped(const char* command) {
+        if (!dropped_) return false;
+        dropped_ = false;
+        static std::mutex mutex;
+        static std::set<std::string> reported;
+        const std::lock_guard lock(mutex);
+        if (reported.size() < 64 && reported.insert(std::string(command) + "." + dropped_field_).second) {
+            std::cerr << "Frame: a " << command << " with " << dropped_field_ << " " << dropped_value_
+                      << " (outside -8192..8192) is left out\n";
+        }
+        return true;
+    }
     bool flag() {
         take();
         const bool valid = lua_type(state_, -1) == LUA_TBOOLEAN;
@@ -242,6 +273,9 @@ private:
     lua_State* state_;
     int table_, count_, next_ = 1;
     std::size_t text_bytes_ = 0;
+    bool dropped_ = false;
+    const char* dropped_field_ = "";
+    double dropped_value_ = 0;
 };
 Result<ScriptFrame> decode_frame(lua_State* state, int table, int count) {
     try {
@@ -255,19 +289,9 @@ Result<ScriptFrame> decode_frame(lua_State* state, int table, int count) {
             target = reader.flag();
         };
         int commands = 0;
-        std::optional<MotionGroup> group;
-        const auto close_group = [&] {
-            // An empty group is kept: its anchor says where a hidden thing would be (see MotionGroup).
-            if (group) {
-                group->last = frame.commands.size();
-                frame.motion.push_back(*group);
-            }
-            group.reset();
-        };
         while (reader.remaining()) {
-            const auto opcode = static_cast<FrameOpcode>(reader.integer(1, 21));
-            const bool grouping = opcode == FrameOpcode::motion_begin || opcode == FrameOpcode::motion_end;
-            if (!grouping && ++commands > 4096) throw std::runtime_error("too many frame commands");
+            if (++commands > 4096) throw std::runtime_error("too many frame commands");
+            const auto opcode = static_cast<FrameOpcode>(reader.integer(1, 18));
             switch (opcode) {
             case FrameOpcode::viewport:
                 if (frame.viewport.width) throw std::runtime_error("duplicate viewport");
@@ -278,16 +302,16 @@ Result<ScriptFrame> decode_frame(lua_State* state, int table, int count) {
             case FrameOpcode::sprite:
             case FrameOpcode::world_sprite: {
                 SpriteCommand sprite{};
-                sprite.resource = reader.resource(); sprite.source = reader.rectangle();
-                sprite.x = reader.integer(); sprite.y = reader.integer();
+                sprite.resource = reader.resource(); sprite.source = reader.area("source");
+                sprite.x = reader.coordinate("x"); sprite.y = reader.coordinate("y");
                 sprite.color_key = reader.flag(); sprite.mirrored = reader.flag(); sprite.flipped = reader.flag();
                 sprite.tint = reader.integer(0, 0xffffff);
                 sprite.scale_x = static_cast<float>(reader.number(0, 32, false));
                 if (sprite.scale_x <= 0) throw std::runtime_error("invalid sprite scale");
-                sprite.translate_x = reader.integer(); sprite.overlay = overlay; sprite.clip = clip;
+                sprite.translate_x = reader.coordinate("translate_x"); sprite.overlay = overlay; sprite.clip = clip;
                 if (opcode == FrameOpcode::world_sprite) {
                     SpriteLighting lighting;
-                    lighting.ground_y = reader.integer();
+                    lighting.ground_y = reader.coordinate("ground_y");
                     lighting.azimuth = static_cast<float>(reader.number(-180, 180, false));
                     lighting.elevation = static_cast<float>(reader.number(12, 89, false));
                     lighting.character = reader.flag(); lighting.casts_shadow = reader.flag();
@@ -295,14 +319,16 @@ Result<ScriptFrame> decode_frame(lua_State* state, int table, int count) {
                     lighting.shadow_opacity = static_cast<float>(reader.number(0, 1, false));
                     sprite.lighting = lighting;
                 }
+                if (reader.dropped("sprite")) break;
                 frame.commands.emplace_back(std::move(sprite));
                 break;
             }
             case FrameOpcode::fill: {
                 FillCommand fill{};
-                fill.area = reader.rectangle(); fill.red = reader.integer(0, 255); fill.green = reader.integer(0, 255);
+                fill.area = reader.area("area"); fill.red = reader.integer(0, 255); fill.green = reader.integer(0, 255);
                 fill.blue = reader.integer(0, 255); fill.alpha = reader.integer(0, 255);
-                fill.overlay = overlay; fill.clip = clip; frame.commands.emplace_back(fill);
+                fill.overlay = overlay; fill.clip = clip;
+                if (!reader.dropped("fill")) frame.commands.emplace_back(fill);
                 break;
             }
             case FrameOpcode::overlay: overlay = reader.flag(); break;
@@ -341,30 +367,22 @@ Result<ScriptFrame> decode_frame(lua_State* state, int table, int count) {
             case FrameOpcode::speed: set_flag(frame.fast); break;
             case FrameOpcode::render_filter:
                 if (frame.render_filter) throw std::runtime_error("duplicate render filter");
-                frame.render_filter = static_cast<RenderFilter>(reader.integer(0, 2));
+                frame.render_filter = static_cast<RenderFilter>(reader.integer(0, 3));
                 break;
             case FrameOpcode::text_input: set_flag(frame.text_input); break;
             case FrameOpcode::replay_drop: set_flag(frame.replay_drop); break;
             case FrameOpcode::fullscreen: set_flag(frame.fullscreen); break;
-            case FrameOpcode::smooth_motion: set_flag(frame.smooth_motion); break;
-            case FrameOpcode::motion_begin:
-                close_group();
-                if (frame.motion.size() >= 2048) throw std::runtime_error("too many motion groups");
-                group = MotionGroup{static_cast<std::uint32_t>(reader.integer(0, 1 << 20)), reader.integer(-65536, 65536),
-                                    reader.integer(-65536, 65536), frame.commands.size(), 0};
-                break;
-            case FrameOpcode::motion_end: close_group(); break;
             case FrameOpcode::text: {
                 TextCommand text{};
                 text.text = std::string(reader.text());
-                text.x = reader.integer(); text.y = reader.integer();
+                text.x = reader.coordinate("x"); text.y = reader.coordinate("y");
                 text.align = static_cast<TextAlign>(reader.integer(0, 2));
                 text.size = reader.integer(6, 64); text.color = reader.integer(0, 0xffffff);
                 // -1: none.
                 if (const int outline = reader.integer(-1, 0xffffff); outline >= 0) text.outline = outline;
                 if (const int background = reader.integer(-1, 0xffffff); background >= 0) text.background = background;
                 text.antialias = reader.flag(); text.overlay = overlay; text.clip = clip;
-                frame.commands.emplace_back(std::move(text));
+                if (!reader.dropped("text")) frame.commands.emplace_back(std::move(text));
                 break;
             }
             case FrameOpcode::file_dialog:
@@ -380,7 +398,6 @@ Result<ScriptFrame> decode_frame(lua_State* state, int table, int count) {
             }
             }
         }
-        close_group();
         if (!frame.viewport.width) throw std::runtime_error("screen must declare a viewport");
         return frame;
     } catch (const std::exception& error) { return fail(ErrorCode::script, error.what()); }
@@ -787,10 +804,11 @@ public:
         // "&n_x_y" a held finger, "?x"/"?w" a renderer/window capability, "~n" a measured fps)
         // or "k", comma-separated virtual-key codes, " m" x,y,button and
         // optionally " p" with the key-down codes, " t" with typed character codes, " g" with
-        // controller button letters, " h" with the touch state and " f" with the scaling modes
-        // the renderer offers. The bound covers 256 held keys and 256 key-downs.
+        // controller button letters, " h" with the touch state, " f" with the scaling modes
+        // the renderer offers and " v" with the age of the display refresh (web). The bound covers
+        // 256 held keys and 256 key-downs.
         const bool keys = input.starts_with('k');
-        const auto allowed = keys ? std::string_view("0123456789,mptgfjhudlrabcexyswk -:")
+        const auto allowed = keys ? std::string_view("0123456789,mptgfjhudlrabcexyswkv -:")
                                   : std::string_view("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/@_!#%^.?$&~");
         if (input.size() > 4096 || input.substr(keys ? 1 : 0).find_first_not_of(allowed) != std::string_view::npos) {
             return fail(ErrorCode::script, "invalid input action");
@@ -843,12 +861,7 @@ Result<std::unique_ptr<ScriptRuntime>> make_script_runtime(bool enable_jit, cons
                                                            SettingsStore& settings, ScriptRecordings& recordings,
                                                            NetworkTransport& network) {
     auto bridge = std::make_unique<ResourceBridge>(resources, data, random, settings, recordings, network);
-    log(LogLevel::info) << "creating Lua state";
-#ifdef OPENLF2_PS5
-    State state(lua_newstate(ps5::lua_alloc, nullptr));
-#else
     State state(luaL_newstate());
-#endif
     if (!state) return fail(ErrorCode::script, "cannot allocate Lua state");
 #ifdef __EMSCRIPTEN__
     if (enable_jit) return fail(ErrorCode::script, "JIT is unavailable in the WebAssembly build");

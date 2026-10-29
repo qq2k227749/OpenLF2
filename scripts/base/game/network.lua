@@ -4,6 +4,9 @@
 local constants = require("base/game/constants")
 local controls = require("base/ui/controls")
 local recording = require("base/game/recording")
+-- The web build plays in relay rooms instead (base/game/room); a session made by either module
+-- goes through the functions here.
+local room = require("base/game/room")
 local network = {}
 local timeout = 30000
 local function failed(state, message)
@@ -43,12 +46,14 @@ local function read_names(state, bytes)
     return true
 end
 function network.create(options)
+    if options.network_relay then return room.create(options) end
     assert(type(options.network_profile) == "string" and #options.network_profile == 64, "missing network profile")
     return {phase = "idle", received = "", sequence = 0, frames = 0,
         version = options.recording_version, profile = "OpenLF2 TCP 1\n" .. options.network_profile,
         port = options.network_port or constants.network.default_port}
 end
 function network.start(state, host, address)
+    if state.relay then return room.start(state, host, address) end
     network.close(state)
     state.host, state.error, state.received = host, nil, ""
     state.names, state.pending, state.sequence, state.frames = nil, nil, 0, 0
@@ -59,12 +64,14 @@ function network.start(state, host, address)
     return true
 end
 function network.close(state)
+    if state.relay then return room.close(state) end
     engine.network("close")
     state.phase, state.pending, state.received = "idle", nil, ""
 end
 -- Called from the lobby or once per attempted tick. No simulation or RNG draw occurs while
 -- waiting. Deadlines measure elapsed real time, never simulation time.
 function network.poll(state)
+    if state.relay then return room.poll(state) end
     if state.phase == "failed" then return nil, state.error end
     local bytes, problem = engine.network("poll")
     if not bytes then return failed(state, problem) end
@@ -139,6 +146,7 @@ function network.packet(state, input, hp)
     return string.char(unpack(bytes))
 end
 function network.exchange(state, input, hp)
+    if state.relay then return room.exchange(state, input, hp) end
     if not state.pending then
         state.sequence = (state.sequence + 1) % 50
         state.pending = network.packet(state, input, hp)
@@ -189,4 +197,18 @@ function network.exchange(state, input, hp)
     state.pending, state.frames = nil, state.frames + 1
     return combined
 end
+-- Whether this tick's typed unlock words go out now: the lockstep packet carries them once per
+-- frame; a relay room sends them with the next input, at any tick.
+function network.takes_unlock_bits(state)
+    if state.relay then return true end
+    return not state.pending
+end
+-- Whether the session sets the pace itself (a relay room runs its frames as they come): the
+-- host then asks for a tick as often as it can, and the session waits until a frame is due.
+function network.paced(state) return state.relay == true end
+-- Relay rooms only: who is in the room, and the host's Start.
+function network.lobby(state) return state.relay and room.lobby(state) or nil end
+function network.begin(state) return state.relay and room.begin(state) or false end
+-- Relay rooms: this computer came with the hidden characters unlocked, which unlocks them for the room.
+function network.share_unlocked(state) if state.relay then room.share_unlocked(state) end end
 return network

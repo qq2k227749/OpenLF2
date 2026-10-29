@@ -335,7 +335,13 @@ private:
         }
         auto& frame = data_.frames[static_cast<std::size_t>(index)];
         if (frame.defined) note("frame " + std::to_string(index) + " redefined; earlier fields kept");
-        frame.name = read_word(section, 20);
+        // The original keeps 19 characters of a frame's name; mods write longer ones, which only
+        // label the frame, so the rest is dropped instead of refusing the file.
+        frame.name = read_word(section, token_capacity);
+        if (frame.name.size() > 19) {
+            note("frame " + std::to_string(index) + " name `" + frame.name + "` cut to 19 characters");
+            frame.name.resize(19);
+        }
         frame.defined = true;
         frame.interactions.clear();
         frame.bodies.clear();

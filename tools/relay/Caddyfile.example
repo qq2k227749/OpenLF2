@@ -1,0 +1,12 @@
+# Caddy gets a free HTTPS certificate for your domain automatically.
+# Browsers on an https:// game page may only open wss:// (secure) WebSockets, so the relay needs this.
+#
+#   1. Point a DNS record (e.g. relay.example.com) at your server's IP.
+#   2. Run the relay:  PORT=8787 TRUST_PROXY=1 ALLOWED_ORIGINS=https://you.github.io node server.js
+#   3. Put this file at /etc/caddy/Caddyfile (replace the domain) and reload Caddy.
+#
+# The game then uses:  wss://relay.example.com/relay
+
+relay.example.com {
+	reverse_proxy 127.0.0.1:8787
+}

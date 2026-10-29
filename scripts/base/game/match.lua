@@ -576,12 +576,15 @@ end
 local function_letters = {"1", "2", "3", "4", "5", "6", "7", "8", "9"}
 note_function_keys = function(state, held)
     if held.function_sources then
-        state.network_function_held = state.network_function_held or {{}, {}}
-        state.network_function_pending = state.network_function_pending or {{}, {}}
+        -- One source per computer: two in a lockstep game, up to eight in a relay room.
+        state.network_function_held = state.network_function_held or {}
+        state.network_function_pending = state.network_function_pending or {}
         state.function_pending = {}
         for key = 1, 9 do
-            for side = 1, 2 do
+            for side = 1, #held.function_sources do
                 local down = held.function_sources[side]:find(tostring(key), 1, true) ~= nil
+                state.network_function_held[side] = state.network_function_held[side] or {}
+                state.network_function_pending[side] = state.network_function_pending[side] or {}
                 local previous, pending = state.network_function_held[side], state.network_function_pending[side]
                 if down and not previous[key] then pending[key] = true end
                 if not down then pending[key] = nil end

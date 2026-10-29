@@ -27,18 +27,25 @@
     #stage:-webkit-full-screen { background: #000; width: 100vw; height: 100vh; height: 100dvh; display: flex; }
     #stage:fullscreen canvas { width: 100% !important; max-width: none !important; height: 100% !important; aspect-ratio: auto; }
     #stage:-webkit-full-screen canvas { width: 100% !important; max-width: none !important; height: 100% !important; aspect-ratio: auto; }
+    /* Large view (while playing, unless turned off): the game takes as much of the window as fits, centred. */
+    #stage.wide { position: relative; width: min(calc(100vw - 2rem), calc((100vh - 1.5rem) * 794 / 550)); left: 50%; transform: translateX(-50%); }
+    @supports (height: 100dvh) { #stage.wide { width: min(calc(100vw - 2rem), calc((100dvh - 1.5rem) * 794 / 550)); } }
+    #stage.wide canvas { max-width: none !important; }
+    #stage.wide:fullscreen { left: 0; transform: none; width: 100vw; }
+    #stage.wide:-webkit-full-screen { left: 0; transform: none; width: 100vw; }
     pre { max-height: 12rem; overflow: auto; white-space: pre-wrap; font-size: .8rem; }
   </style>
 </head>
 <body>
 <main>
   <h1><img src="icon.svg" alt="" width="48" height="48">OpenLF2</h1>
-  <p>Press <b>Start game</b> to download the original LF2 v2.0a game data from archive.org (about 30 MB, checked by SHA-256), or select your own <code>LF2_v2.0a.exe</code> or <code>lf2_v20a_Setup.exe</code> installer manually. Your browser saves the installer for future visits; a selected file is not uploaded to a server.</p>
+  <p>Press <b>Start game</b> to download the original LF2 v2.0a game data (about 30 MB, checked by SHA-256) from the online relay when it keeps a copy, else from archive.org, or select your own <code>LF2_v2.0a.exe</code> or <code>lf2_v20a_Setup.exe</code> installer manually. Your browser saves the installer for future visits; a selected file is not uploaded to a server.</p>
   <div class="controls">
     <button id="choose" type="button">Select file manually…</button>
     <input id="installer" type="file" accept=".exe,application/octet-stream" aria-label="LF2 v2.0a installer" hidden>
     <span id="chosen" hidden></span>
     <button id="start" disabled>Start game</button>
+    <button id="wide" hidden>Normal view</button>
     <button id="fullscreen" disabled>Fullscreen</button>
   </div>
   <progress id="progress" hidden></progress>
@@ -47,6 +54,9 @@
   <details><summary>Diagnostic output</summary><pre id="log"></pre></details>
 </main>
 <script src="installer-store.js"></script>
+<!-- Network play through a relay (online.js). To give everyone on this site a default relay, add before it:
+     <script>window.OPENLF2_RELAY = 'wss://relay.example.com/relay';</script> -->
+<script src="online.js"></script>
 <script>
   const installer = document.getElementById('installer');
   const start = document.getElementById('start');
@@ -60,6 +70,23 @@
     log.scrollTop = log.scrollHeight;
   }
   const canvas = document.getElementById('canvas');
+  // Large view: on by default while playing; the choice is remembered.
+  const stageElement = document.getElementById('stage');
+  const wideButton = document.getElementById('wide');
+  let wide = true;
+  try { wide = localStorage.getItem('openlf2-wide') !== '0'; } catch (error) { /* storage unavailable */ }
+  function applyWide(scroll) {
+    stageElement.classList.toggle('wide', wide && started);
+    wideButton.textContent = wide ? 'Normal view' : 'Large view';
+    window.dispatchEvent(new Event('resize'));
+    if (scroll && wide) stageElement.scrollIntoView({block: 'center', behavior: 'smooth'});
+  }
+  wideButton.addEventListener('click', () => {
+    wide = !wide;
+    try { localStorage.setItem('openlf2-wide', wide ? '1' : '0'); } catch (error) { /* storage unavailable */ }
+    applyWide(true);
+    canvas.focus({preventScroll: true});
+  });
   const fullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement;
   const fullscreen = document.getElementById('fullscreen');
   function update() {
@@ -111,7 +138,7 @@
         } else if (file) {
           launch(file, false);
         } else {
-          status.textContent = 'Ready. Press Start to download the game data from archive.org, or select your installer manually.';
+          status.textContent = 'Ready. Press Start game to download the game data, or select your installer manually.';
         }
       });
     }
@@ -140,6 +167,8 @@
         'Running OpenLF2. Browser storage is unavailable; select the installer again next visit.';
       Module.callMain(['--config-dir', '/data']);
       Module.canvas.focus({preventScroll: true});
+      wideButton.hidden = false;
+      applyWide(true);
     } catch (error) {
       if (!saveSelection) {
         try { await installerStore.remove(); }
@@ -170,10 +199,10 @@
     progress.hidden = false;
     update();
     try {
-      const blob = await installerDownload((received, total) => {
+      const blob = await installerDownload((received, total, source) => {
         progress.max = total;
         progress.value = received;
-        status.textContent = 'Downloading LF2 v2.0a from archive.org: ' + (received / 1e6).toFixed(1) + ' / ' + (total / 1e6).toFixed(1) + ' MB';
+        status.textContent = 'Downloading LF2 v2.0a game data from ' + source + ': ' + (received / 1e6).toFixed(1) + ' / ' + (total / 1e6).toFixed(1) + ' MB';
       });
       downloading = false;
       progress.hidden = true;
@@ -182,7 +211,7 @@
       downloading = false;
       progress.hidden = true;
       update();
-      status.textContent = 'Download failed. Select your installer manually, then start the game.';
+      status.textContent = 'Download failed. If a download manager (such as IDM) opened, let it save the file, then press "Select file manually…", choose it and start the game.';
       message(String(error));
     }
   }

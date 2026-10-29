@@ -14,9 +14,14 @@ local frames = {[1] = {0, 41, 434, 80}, [2] = {434, 41, 62, 68}, [3] = {0, 247, 
     [5] = {500, 42, 291, 27}, [6] = {500, 72, 291, 27}, [10] = {460, 203, 334, 108},
     [11] = {460, 313, 334, 108}, [12] = {643, 426, 151, 26}, [13] = {489, 426, 151, 26},
     [14] = {490, 462, 304, 38}}
+-- A relay room's lobby (OpenLF2 extension): a panel listing the players, with Start for the host.
+local lobby_panel = {left = 176, top = 228, right = 618, bottom = 444}
+local start_button = {left = 236, top = 404, right = 386, bottom = 429}
+local lobby_cancel = {left = 410, top = 404, right = 560, bottom = 429}
 local function inside(input, left, top, right, bottom)
     return input.pointer_x >= left and input.pointer_x <= right and input.pointer_y >= top and input.pointer_y <= bottom
 end
+local function in_box(input, box) return inside(input, box.left, box.top, box.right, box.bottom) end
 function screen.create(options)
     return {session = transport.create(options), page = "choice", address = "", previous_keys = {},
         nav = navigation.create(), keyboard = false,
@@ -30,9 +35,16 @@ function screen.begin(state, host, address)
     state.started = engine.network_time()
 end
 -- The clickable areas for keyboard and controller navigation (base/ui/navigation); the join
--- page starts on its Connect button so Enter connects at once, as it always did.
-local function navigation_spec(page)
-    local target = navigation.target
+-- page starts on its Connect button so Enter connects at once, as it always did, and a room's
+-- host starts on Start.
+local function navigation_spec(state)
+    local page, target = state.page, navigation.target
+    if page == "waiting" and state.session.relay then
+        local cancel = target(lobby_cancel.left, lobby_cancel.top, lobby_cancel.right, lobby_cancel.bottom)
+        if not state.session.host then return {page = "lobby", targets = {cancel}} end
+        return {page = "lobby_host", autofocus = true, targets = {target(start_button.left, start_button.top,
+            start_button.right, start_button.bottom), cancel}}
+    end
     if page == "waiting" then return {page = page, targets = {target(0x142, 0x169, 0x1d8, 0x182)}} end
     if page == "join" then
         return {page = page, autofocus = true,
@@ -42,29 +54,36 @@ local function navigation_spec(page)
         target(0x104, 0x150, 0x223, 0x169)}}
 end
 function screen.update(state, flow_input, context)
-    local input = navigation.apply(state.nav, flow_input, navigation_spec(state.page))
+    local input = navigation.apply(state.nav, flow_input, navigation_spec(state))
     state.pointer_x, state.pointer_y = input.pointer_x, input.pointer_y
     local cancel = input.nav.cancel
+    local relay = state.session.relay
     if state.page == "waiting" then
-        cancel = cancel or input.click and inside(input, 0x142, 0x169, 0x1d8, 0x182)
+        if relay then cancel = cancel or input.click and in_box(input, lobby_cancel)
+        else cancel = cancel or input.click and inside(input, 0x142, 0x169, 0x1d8, 0x182) end
         if not cancel then
             local ready, problem = transport.poll(state.session)
             if ready then context.action("network_ready")
-            elseif problem then state.page, state.message = "choice", problem end
+            elseif problem then state.page, state.message = "choice", problem
+            elseif relay and input.click and in_box(input, start_button) and transport.begin(state.session) then
+                sounds.direct(state, "ok")
+            end
         end
     elseif state.page == "join" then
+        -- A room code (digits) in a relay room, else an IPv4 address.
+        local allowed, longest = relay and "^%d$" or "^[%d.]$", relay and 12 or 15
         for code = 0, 255 do
             if input.keys[code] and not state.previous_keys[code] then
                 if code == virtual_keys.backspace then state.address = state.address:sub(1, -2)
                 else
                     local character = controls.key_character(code, false)
-                    if character and character:match("^[%d.]$") and #state.address < 15 then state.address = state.address .. character end
+                    if character and character:match(allowed) and #state.address < longest then state.address = state.address .. character end
                 end
             end
         end
         -- Text a soft keyboard delivers without key events.
-        for character in input.text:gmatch("[%d.]") do
-            if #state.address < 15 then state.address = state.address .. character end
+        for character in input.text:gmatch(relay and "%d" or "[%d.]") do
+            if #state.address < longest then state.address = state.address .. character end
         end
         cancel = cancel or input.click and inside(input, 0x19b, 0x165, 0x231, 0x17e)
         -- Enter connects wherever the focus is (the raw keys: navigation may have taken it).
@@ -96,6 +115,43 @@ function screen.update(state, flow_input, context)
     end
     for _, sound in ipairs(sounds.flush(state)) do context.sound(sound.resource, sound.volume, sound.pan) end
 end
+local function box(context, area, border, fill)
+    context.fill(area.left, area.top, area.right - area.left + 1, area.bottom - area.top + 1, border[1], border[2], border[3])
+    context.fill(area.left + 2, area.top + 2, area.right - area.left - 3, area.bottom - area.top - 3, fill[1], fill[2], fill[3])
+end
+local panel_border, panel_fill = {90, 119, 216}, {0, 30, 80}
+-- The relay room's lobby: who is in, and Start for the host.
+local function draw_lobby(state, context)
+    local lobby = transport.lobby(state.session)
+    local dots = string.rep(".", math.floor((engine.network_time() - state.started) / 400) % 4)
+    box(context, lobby_panel, panel_border, panel_fill)
+    local left, right = lobby_panel.left + 14, lobby_panel.right - 14
+    local title = lobby.code and i18n.tr("Room %s", lobby.code) or i18n.tr("Online room")
+    font.gdi(context, title, left, lobby_panel.top + 10)
+    if lobby.joined then
+        font.gdi(context, i18n.tr("%d / %d players", #lobby.players, lobby.most), right, lobby_panel.top + 10, 0xffffff, nil, "right")
+    end
+    context.fill(left, lobby_panel.top + 31, right - left, 1, panel_border[1], panel_border[2], panel_border[3])
+    for index, player in ipairs(lobby.players) do
+        local column, row = math.floor((index - 1) / 4), (index - 1) % 4
+        local name = index .. ". " .. player.name .. (player.host and " " .. i18n.tr("(host)") or "")
+        font.gdi(context, name, left + 6 + column * 214, lobby_panel.top + 42 + row * 22, player.host and 0xffd700 or 0xffffff)
+    end
+    local note
+    if not lobby.joined then note = i18n.tr("Connecting to the relay") .. dots
+    elseif lobby.host and #lobby.players < 2 then note = i18n.tr("Waiting for friends to join") .. dots
+    elseif lobby.host then note = i18n.tr("Press START when everyone is in.")
+    else note = i18n.tr("Waiting for the host to start") .. dots end
+    font.gdi(context, note, math.floor((lobby_panel.left + lobby_panel.right) / 2), lobby_panel.top + 140, 0xc8d2ff, nil, "center")
+    if lobby.host then
+        local hot = lobby.can_start and inside(state, start_button.left, start_button.top, start_button.right, start_button.bottom)
+        box(context, start_button, lobby.can_start and (hot and {255, 255, 255} or panel_border) or {70, 70, 90},
+            hot and {20, 70, 160} or {0, 40, 110})
+        font.gdi(context, i18n.tr("START"), math.floor((start_button.left + start_button.right) / 2), start_button.top + 5,
+            lobby.can_start and 0xffffff or 0x8088a0, nil, "center")
+    end
+    context.sprite("pe/menu_clip", frames[12], lobby_cancel.left, lobby_cancel.top, true)
+end
 function screen.draw(state, context)
     local function sprite(frame, x, y) context.sprite("pe/menu_clip", frames[frame], x, y, true) end
     context.viewport(constants.screen.width, constants.screen.height, 16, 32, 108)
@@ -106,9 +162,16 @@ function screen.draw(state, context)
     sprite(3, 0xfd, 0xde)
     sprite(14, 0xfd, 0x14f)
     -- The original writes " Your IP Address: <address>" here on an opaque box, which also hides
-    -- the art's own label; OpenLF2 has no address to show, so it shows its TCP port instead.
-    font.gdi(context, " " .. i18n.tr("Your TCP port: %s", state.session.port), 0x121, 0xfb, 0xffffff, 0x001e50)
-    if state.page == "waiting" then
+    -- the art's own label; OpenLF2 has no address to show, so it shows its TCP port instead, or
+    -- for a relay room what the room holds.
+    if state.session.relay then
+        font.gdi(context, " " .. i18n.tr("Online: up to 8 players per room"), 0x121, 0xfb, 0xffffff, 0x001e50)
+    else
+        font.gdi(context, " " .. i18n.tr("Your TCP port: %s", state.session.port), 0x121, 0xfb, 0xffffff, 0x001e50)
+    end
+    if state.page == "waiting" and state.session.relay then
+        draw_lobby(state, context)
+    elseif state.page == "waiting" then
         sprite(state.session.host and 10 or 11, 0xec, 0x122)
         sprite(12, 0x142, 0x169)
         local count = math.floor((engine.network_time() - state.started) / 150) % 14
@@ -118,6 +181,9 @@ function screen.draw(state, context)
         sprite(13, 0xef, 0x165)
         sprite(12, 0x19b, 0x165)
         font.gdi(context, state.address .. "_", 0x153, 0x147, 0xffffff, 0x001e50)
+        if state.session.relay then
+            font.gdi(context, i18n.tr("Room code (empty: the room of your invite link)"), 0x18a, 0x186, 0xc8d2ff, 0x001e50, "center")
+        end
     else
         local input = {pointer_x = state.pointer_x, pointer_y = state.pointer_y}
         if inside(input, 0x104, 0x112, 0x223, 0x12c) then sprite(5, 0x103, 0x112) end
@@ -128,6 +194,9 @@ function screen.draw(state, context)
     context.image("pe/lf2_cursor", math.min(state.pointer_x, 0x307), math.min(state.pointer_y + 2, 0x217), true)
 end
 function screen.describe(state)
-    return "network_page=" .. state.page .. " phase=" .. state.session.phase .. (state.message and " error=" .. state.message or "")
+    local lobby = transport.lobby(state.session)
+    return "network_page=" .. state.page .. " phase=" .. state.session.phase
+        .. (lobby and lobby.joined and " players=" .. #lobby.players or "")
+        .. (state.message and " error=" .. state.message or "")
 end
 return screen

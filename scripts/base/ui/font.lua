@@ -26,16 +26,20 @@ local function tinted(color, tint)
 end
 -- Estimated width in pixels of TrueType text: layouts here only know the bitmap font's metrics.
 local function ttf_width(text) return math.floor(i18n.width(text, ttf_size)) end
+-- Whether text goes TrueType: in a translated language, and also when the game's WORDS bitmaps
+-- lack letters or digits (a mod repainted them: One Piece GrandWorld has no C, m or o) and the
+-- host can draw TrueType text. Defined below, once the bitmap can be measured.
+local use_ttf
 -- Width of `text` drawn by font.draw.
 function font.width(text)
-    return i18n.active() and ttf_width(text) or #text * 8
+    return use_ttf() and ttf_width(text) or #text * 8
 end
 
 -- `tint`: 0xRRGGBB multiplied into the glyph colors (nil leaves them). `align`: "left" (default),
 -- "center" or "right": `x` is that edge of the text. Text drawn in a translated language goes through
 -- i18n.tr first, so labels the scripts build (difficulties, slot names ...) are translated too.
 function font.draw(context, text, x, y, variant, tint, align)
-    if i18n.active() then
+    if use_ttf() then
         text = i18n.tr(text)
         if text == "" then return end
         local colors = variant_colors[variant or font_variants.white]
@@ -112,9 +116,42 @@ local function measure()
     end
 end
 
+local words_incomplete
+-- Whether the WORDS bitmaps lack letters or digits and the host can draw TrueType text instead.
+function font.bitmap_incomplete()
+    if not i18n.host_text() then return false end
+    if words_incomplete == nil then
+        if not gdi_widths then measure() end
+        words_incomplete = false
+        for code = 0, 255 do
+            if string.char(code):match("%w") and not gdi_widths[code] then words_incomplete = true end
+        end
+    end
+    return words_incomplete
+end
+use_ttf = function() return i18n.active() or font.bitmap_incomplete() end
+local gdi_ttf = use_ttf
+
+-- Labels drawn glyph by glyph from WORDS<variant> at a fixed `advance` (the names over the fighters, their
+-- lives, the status bar's marks), in every language; TrueType in the variant's colors when the bitmaps lack
+-- letters, centred where the glyphs would be.
+function font.glyphs(context, variant, text, x, y, advance)
+    -- Marks outside ASCII (the status bar's square) stay pictures.
+    if font.bitmap_incomplete() and not text:find("[\128-\255]") then
+        local colors = variant_colors[variant] or variant_colors[font_variants.white]
+        context.text(text, x + math.floor(#text * advance / 2), y + 1, "center", ttf_size, colors[1], colors[2], nil, i18n.antialias())
+        return
+    end
+    for position = 1, #text do
+        local code = text:byte(position)
+        context.sprite("pe/words" .. variant, {(code % 16) * 16, math.floor(code / 16) * 16 + 1, 8, 16},
+            x + (position - 1) * advance, y, true)
+    end
+end
+
 -- Width of GDI text in pixels: the advances of `gdi` below.
 function font.gdi_width(text)
-    if i18n.active() then return ttf_width(text) end
+    if gdi_ttf() then return ttf_width(text) end
     if not gdi_widths then measure() end
     local width = 0
     for position = 1, #text do
@@ -128,7 +165,7 @@ end
 -- swapped for COLORREF); `background`, if given, paints an opaque box behind the text (16px high).
 -- `align` as for font.draw; `size` is the TrueType font size (translated languages only).
 function font.gdi(context, text, x, y, color, background, align, size)
-    if i18n.active() then
+    if gdi_ttf() then
         text = i18n.tr(text)
         if text == "" then return end
         context.text(text, x, y, align or "left", size or ttf_size, color or 0xffffff, nil, background, i18n.antialias())
